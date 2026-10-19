@@ -1,0 +1,38 @@
+{
+  "adams-il": {
+    "name": "Adams County, IL",
+    "server": "https://www.adamscountyarcserver.com/adamscountyarcserver/rest/services/Adams_County_Basemap_Complete/MapServer",
+    "layers": {
+      "parcels": 13,
+      "roads": 4,
+      "streams_named": 33,
+      "streams_all": 34,
+      "buildings": 47,
+      "firm_zones": 42,
+      "subdivisions": 15,
+      "quincy_zoning": 25
+    },
+    "pin_field": "PIN",
+    "pin_normalize": "digits",
+    "fields": {
+      "situs": "SiteAddress",
+      "acres": "Acres",
+      "owner": "OwnerName",
+      "use": "UseCode",
+      "legal": "LegalDesc",
+      "road_name": "LabelName",
+      "stream_name": "NAME1",
+      "firm_zone": "FLD_ZONE",
+      "firm_sfha": "SFHA_TF"
+    },
+    "defaults": {"state": "IL", "county": "Adams"},
+    "use_codes": {
+      "11": "farm / agricultural",
+      "21": "farm with residence",
+      "30": "vacant lot",
+      "40": "residential",
+      "50": "commercial",
+      "60": "industrial"
+    }
+  }
+}
