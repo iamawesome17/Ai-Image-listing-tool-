@@ -77,8 +77,14 @@ Domains the workspace must be allowed to reach (claude.ai → Settings → Capab
 | `nc` | North Carolina statewide (NC OneMap) | `parno` as on the county site | federal | parcel numbers are not unique statewide in a few counties — first match wins |
 | `fl` | Florida statewide (FDACS parcels) | `PARCEL_ID` | federal | no situs field → Geocoding fills street/city/zip |
 | `va` | Virginia statewide (VGIN) | `PARCELID` (localities format these differently; spacing is normalized) | federal | county from `LOCALITY`; Geocoding fills the rest |
-| `regrid` | any US county on a paid Regrid plan | APN or street address | federal | trial token covers only 7 demo counties |
+| `realie` | **any US county** (Realie.ai, free tier, `REALIE_TOKEN`) | APN + state + county, or street address + state | federal | polygon, acres, situs, owner, use, legal. The nationwide default. |
+| `cass-mo` | Cass County, MO (CAMAvision WFS) | parcel id as on the assessor site | federal | pattern for Vanguard CAMAvision counties (MO/IA): attributes from `parcels`, polygon from `search` matched by envelope |
+| user-added | any county with a public ArcGIS parcel layer or CAMAvision map | layer's own id field | federal | **Counties tab** in the app: state + county (+ optional layer URL); fields auto-detected, checked live; saved to `DATA_DIR/counties_user.json` (mount a Railway volume at /app/data to keep them across deploys) |
+| `regrid` | any US county on a paid Regrid plan ($375/mo — not used) | APN or street address | federal | trial token covers only 7 demo counties |
 | boundary file | anywhere | — | federal | Land id → export KML; Google Earth → KML/KMZ; shapefile as .zip. Largest polygon is used; acreage from geometry |
+
+Florida uses the FGIO hosted copy of the DOR cadastral (`services9.arcgis.com/Gh9awoU677aKree0/.../Florida_Statewide_Cadastral/FeatureServer/0`) —
+the FDACS layer answers id lookups in 40+ s and times out. Parcel ids are stored as each county appraiser formats them (mostly digits only); the lookup sends both forms in one `IN (...)` query.
 
 Missouri: no free statewide parcel layer (counties publish their own, or none). Options: Regrid self-serve plan (nationwide, ~$0.05–0.10/lookup),
 or export the parcel from Land id as KML and use the boundary-file option. onX Hunt does not export parcel boundaries; Pixly adds nothing here.
@@ -96,13 +102,31 @@ USA Structures FeatureServer/0. All scan calls have a 25 s timeout and fail soft
 5. Allow the host, then run `pipeline.py --county <key> --pin <PIN> --no-render` to check the parcel + scan before paying for renders.
 Counties on Regrid skip all of this (`--regrid`), but Regrid has no road/stream/building/flood layers — the scan is thinner.
 
+## Layout, callouts and the editor (layout.py, editor.js, "Review & edit" tab)
+
+Everything drawn on an image lives in `out/<PIN>/layout.json` in **ground coordinates** (lon/lat): boundary, acreage card anchor + text,
+callouts (POND, CREEK, DRIVEWAY, ELECTRIC POLES & LINES, BUILDING(S), TIMBER/PASTURE), road pins, disclaimer. Each image has a *ground map*
+in `maps.json` that turns lon/lat into its pixels:
+- satellite images: exact Web-Mercator frame;
+- AI renders: a homography fitted to the magenta marker (ICP between the reference polygon and the marker centreline) — a flat-ground
+  render is exactly a homography, so road pins land on the road in every angle; fit error is logged (typ. 15–30 px at 2K);
+- real drone photos: homography from the metadata projection, or from corners the user drags in the editor (exact vertex correspondence,
+  RANSAC when ≥6), or a rough bbox map until then (auto callouts hidden).
+`pipeline.py --finalize out/<PIN>` redraws every image from the layout and rebuilds the packet without any API call; the editor's
+**Apply edits & rebuild packet** does the same after folding the pixel edits back through that image's ground map. Unmoved items keep their
+exact ground position; moved items are re-projected. Low horizon views (`--low auto`: road side + opposite) use a near-ground prompt and a
+bottom-anchored crop that keeps the sky. The plat exhibit (plat.py) is drawn from the same boundary: bearings/distances per course, PLSS
+section-township-range (BLM CadNSDI), adjoiner PINs, roads, north arrow, scale bar, course table — "not a survey" footer.
+
 ## Real drone photo (drone_photo.py / "Real drone photo" tab)
 
 Puts the true property line (and the acreage card, road labels, disclaimer) on a photo the drone actually took, with an optional golden-hour relight.
 1. Line placement: DJI photos straight from the SD card carry XMP tags (`drone-dji:GpsLatitude/GpsLongitude/RelativeAltitude/GimbalYawDegree/GimbalPitchDegree`)
    plus EXIF focal length. The parcel polygon is projected through a flat-ground pinhole camera model (validated to ~1.5 px on a synthetic frame).
-   Photos that went through a phone, chat app, or editor lose those tags → the tool says which tags it found and falls back to **clicking the corners** in the UI
-   (clicks are taken on a 1600-px working copy so redraws are instant).
+   Photos that went through a phone, chat app, or editor lose those tags → the tool says which tags it found. Then either click the corners on the photo
+   (4+ clicks → the parcel shape is matched to the clicks and the true outline with every jog is drawn), or just press Annotate: the true parcel shape is
+   placed in the middle and you **drag its corners** onto the real corners in Review & edit — 4 moved corners are enough, the rest snap into place and the
+   callouts appear (validated at 1.8 px on a synthetic frame).
 2. Golden hour: the polygon is drawn as a thin magenta marker, Grok re-lights the photo keeping the marker, the marker is detected, erased and redrawn as the styled line.
    Outputs: `<photo>_original_with_lines.jpg`, `<photo>_golden_with_lines.jpg`, `<photo>_golden_no_lines.jpg`.
 Camera: DJI Mini 2 (24 mm equiv, 4:3) is the reference; any DJI with the same tags works.
