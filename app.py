@@ -17,8 +17,8 @@ PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 def run(county, pin, lat, lon, angles, lights, render):
     pin = (pin or "").strip()
-    if not pin and (lat is None or lon is None):
-        raise gr.Error("Enter a PIN or a lat/lon.")
+    if not pin and not (lat and lon):          # Gradio shows empty numbers as 0
+        raise gr.Error("Enter a PIN, or both a latitude and a longitude.")
     cmd = [sys.executable, str(HERE / "pipeline.py"), "--county", county, "--angles", angles, "--lights", lights]
     cmd += ["--pin", pin] if pin else ["--lat", str(lat), "--lon", str(lon)]
     if not render: cmd.append("--no-render")
@@ -52,7 +52,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
     with gr.Row():
         lat = gr.Number(label="…or latitude", value=None); lon = gr.Number(label="longitude", value=None)
     with gr.Row():
-        angles = gr.Textbox(value="S,E,W,N", label="Angles (camera side)")
+        angles = gr.Textbox(value="S,E,W,N", label="Angles (camera side; also NE,SE,SW,NW)")
         lights = gr.Textbox(value="golden,day", label="Lighting")
         render = gr.Checkbox(value=True, label="Generate AI drone views (costs ~$0.50)")
     go = gr.Button("Create packet", variant="primary")
