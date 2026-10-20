@@ -58,22 +58,64 @@ def county_query(cfg, layer, params, stage="gis"):
     return getjson(base + urllib.parse.urlencode(q), stage, layer=layer)
 
 
+def layer_query(url, params, stage="gis", fmt="geojson"):
+    """Query any ArcGIS feature/map layer URL (…/MapServer/13 or …/FeatureServer/0)."""
+    q = {"f": fmt, "outSR": 4326, "returnGeometry": "true", "outFields": "*", **params}
+    return getjson(url.rstrip("/") + "/query?" + urllib.parse.urlencode(q), stage)
+
+
+def pin_variants(pin, mode):
+    raw = pin.strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    tight = "".join(ch for ch in raw.upper() if ch.isalnum())
+    if mode == "digits": return [digits]
+    out = []
+    for v in (raw, raw.upper(), tight, digits, raw.replace("-", "").replace(" ", "")):
+        if v and v not in out: out.append(v)
+    return out
+
+
+def reverse_geocode(lat, lon):
+    """city / county / zip from Google Geocoding (returns {} if the API is not enabled on the key)."""
+    try:
+        d = getjson("https://maps.googleapis.com/maps/api/geocode/json?" + urllib.parse.urlencode({"latlng": f"{lat},{lon}", "key": os.environ["GOOGLE_MAPS_KEY"]}), "geocode")
+        out = {}
+        for r in d.get("results", []):
+            for c in r.get("address_components", []):
+                t = c["types"]
+                if "locality" in t and "city" not in out: out["city"] = c["long_name"]
+                if "administrative_area_level_2" in t and "county" not in out: out["county"] = c["long_name"].replace(" County", "")
+                if "postal_code" in t and "zip" not in out: out["zip"] = c["long_name"]
+                if "route" in t and "street" not in out: out["street"] = c["long_name"]
+            if len(out) >= 3: break
+        return out
+    except Exception:
+        return {}
+
+
 def fetch_parcel_county(cfg, pin=None, lat=None, lon=None):
+    """Parcel from a county or statewide ArcGIS parcel layer, normalized to the pipeline's parcel dict."""
+    url = cfg.get("parcels_url") or f"{cfg['server']}/{cfg['layers']['parcels']}"
+    F = cfg["fields"]; d = {}
     if pin:
-        p = "".join(ch for ch in pin if ch.isdigit()) if cfg.get("pin_normalize") == "digits" else pin
-        d = county_query(cfg, "parcels", {"where": f"{cfg['pin_field']}='{p}'"}, "parcel")
+        for v in pin_variants(pin, cfg.get("pin_normalize", "loose")):
+            d = layer_query(url, {"where": f"{cfg['pin_field']}='{v}'"}, "parcel")
+            if d.get("features"): break
     else:
-        d = county_query(cfg, "parcels", {"geometry": f"{lon},{lat}", "geometryType": "esriGeometryPoint", "inSR": 4326,
-                                          "spatialRel": "esriSpatialRelIntersects"}, "parcel")
+        d = layer_query(url, {"geometry": f"{lon},{lat}", "geometryType": "esriGeometryPoint", "inSR": 4326, "spatialRel": "esriSpatialRelIntersects"}, "parcel")
     if not d.get("features"):
-        sys.exit("No parcel found in county GIS for that PIN / point.")
-    f = d["features"][0]
-    F = cfg["fields"]; pr = f["properties"]
-    # normalize to listing_shot's parcel dict using the county field map
-    norm = {"PIN": pr.get(cfg["pin_field"]), "SiteAddress": pr.get(F["situs"]), "Acres": pr.get(F["acres"]),
-            "OwnerName": pr.get(F["owner"]), "UseCode": str(pr.get(F["use"]) or ""), "LegalDesc": pr.get(F.get("legal", ""))}
-    parcel = ls.parcel_from_feature({"geometry": f["geometry"], "properties": norm}, cfg["defaults"])
-    parcel["use_desc"] = cfg.get("use_codes", {}).get(parcel["use"], f"county use code {parcel['use']}")
+        sys.exit(f"No parcel found in {cfg['name']} for that parcel number / point. Check the number as it appears on the county assessor site.")
+    f = d["features"][0]; pr = f["properties"]
+    g = lambda k: pr.get(F[k]) if k in F else None
+    norm = {"PIN": pr.get(cfg["pin_field"]), "SiteAddress": g("situs"), "Acres": g("acres"), "OwnerName": g("owner"),
+            "UseCode": str(g("use") or ""), "LegalDesc": g("legal"), "county": g("county")}
+    parcel = ls.parcel_from_feature({"geometry": f["geometry"], "properties": norm}, cfg.get("defaults", {}))
+    if cfg.get("reverse_geocode") or not parcel["county"] or not parcel["situs"]:
+        c = parcel["polygon"].centroid; rg = reverse_geocode(c.y, c.x)
+        parcel["city"] = parcel["city"] or rg.get("city", ""); parcel["zip"] = parcel["zip"] or rg.get("zip", "")
+        parcel["county"] = parcel["county"] or rg.get("county", "")
+        if not parcel["situs"] and rg.get("street"): parcel["situs"] = rg["street"]
+    parcel["use_desc"] = cfg.get("use_codes", {}).get(parcel["use"], (parcel["use"] if parcel["use"] and not parcel["use"].isdigit() else f"use code {parcel['use']}") if parcel["use"] else "land")
     parcel["feature"] = f
     return parcel
 
@@ -169,6 +211,69 @@ def scan_surroundings(cfg, parcel, sat_wide, frame_wide):
             scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, f"code {u}"), "acres": at.get(F["acres"])})
 
     # POIs + land cover
+    try:
+        scan["pois"] = ls.nearby_pois(c.y, c.x, radius_m=2500)[:5]; log("scan", "Google Places nearby", n=len(scan["pois"]))
+    except Exception as e:
+        log("scan", "Places failed", err=str(e))
+    scan["landcover"] = landcover_stats(sat_wide, frame_wide, poly)
+    scan["powerlines"] = osm_powerlines(poly)
+    return scan
+
+
+def scan_federal(fed, cfg, parcel, sat_wide, frame_wide):
+    """Surroundings scan from nationwide layers: TIGER roads, NHD water, FEMA flood zones, USA Structures, parcel-layer neighbors."""
+    poly = parcel["polygon"]; c = poly.centroid
+    minx, miny, maxx, maxy = poly.bounds; pad = 0.004
+    env = json.dumps({"xmin": minx - pad, "ymin": miny - pad, "xmax": maxx + pad, "ymax": maxy + pad, "spatialReference": {"wkid": 4326}})
+    envq = {"geometry": env, "geometryType": "esriGeometryEnvelope", "inSR": 4326, "spatialRel": "esriSpatialRelIntersects"}
+    scan = {"roads": [], "water": [], "buildings": {}, "flood": {}, "neighbors": [], "pois": []}
+    def safe(fn, what):
+        try: return fn()
+        except Exception as e: log("scan", f"{what} unavailable", err=str(e)[:80]); return {}
+    # roads
+    d = safe(lambda: layer_query(fed["roads"]["url"], envq, "scan"), "TIGER roads")
+    for f in d.get("features", []):
+        g = shape(f["geometry"]); name = (f["properties"].get(fed["roads"]["name"]) or "").strip()
+        if not name or g.is_empty: continue
+        lines = [g] if isinstance(g, LineString) else list(getattr(g, "geoms", []))
+        near = min((l.interpolate(l.project(c)) for l in lines), key=lambda p: meters(p, c))
+        dist = min(meters(Point(q), poly.exterior.interpolate(poly.exterior.project(Point(q)))) for l in lines for q in l.coords)
+        scan["roads"].append({"name": name.title(), "side": bearing(c, near), "distance_m": round(dist), "adjacent": dist < 25,
+                              "label_lon": near.x, "label_lat": near.y, "geometry": [[[round(x, 6), round(y, 6)] for x, y, *_ in l.coords] for l in lines]})
+    best = {}
+    for r in scan["roads"]:
+        if r["name"] not in best: best[r["name"]] = r
+        else:
+            b = best[r["name"]]; b["geometry"] += r["geometry"]
+            if r["distance_m"] < b["distance_m"]: b.update({k: r[k] for k in ("side", "distance_m", "adjacent", "label_lon", "label_lat")})
+    scan["roads"] = sorted(best.values(), key=lambda r: r["distance_m"])
+    # water: streams + waterbodies
+    for key, label in (("streams", "creek"), ("waterbodies", "pond")):
+        d = safe(lambda: layer_query(fed[key]["url"], envq, "scan"), f"NHD {key}")
+        for f in d.get("features", []):
+            g = shape(f["geometry"]); name = (f["properties"].get(fed[key]["name"]) or "").strip()
+            if g.is_empty: continue
+            crosses = g.intersects(poly); dist = 0 if crosses else round(g.distance(poly) * 111320)
+            if crosses or dist < 400:
+                scan["water"].append({"name": name.title() or f"unnamed {label}", "crosses_parcel": crosses, "distance_m": dist, "side": bearing(c, g.centroid)})
+    seen = set(); scan["water"] = [w for w in scan["water"] if not (w["name"] in seen or seen.add(w["name"]))]
+    # buildings
+    d = safe(lambda: layer_query(fed["buildings"]["url"], {**envq, "outFields": "OBJECTID"}, "scan"), "USA Structures")
+    bl = d.get("features", []); inside = [f for f in bl if shape(f["geometry"]).intersects(poly)]
+    scan["buildings"] = {"layer_features_nearby": len(bl), "inside_parcel": len(inside), "coverage_note": "USA Structures (nationwide footprints)"}
+    # flood
+    d = safe(lambda: layer_query(fed["flood"]["url"], {**envq, "outFields": f"{fed['flood']['zone']},{fed['flood']['sfha']}"}, "scan"), "FEMA NFHL")
+    fz = [{"zone": f["properties"].get(fed["flood"]["zone"]), "sfha": f["properties"].get(fed["flood"]["sfha"])} for f in d.get("features", []) if shape(f["geometry"]).intersects(poly)]
+    scan["flood"] = {"zones_touching_parcel": fz}
+    # neighbors from the same parcel layer
+    if cfg.get("parcels_url") and "use" in cfg["fields"]:
+        d = safe(lambda: layer_query(cfg["parcels_url"], {**envq, "outFields": f"{cfg['pin_field']},{cfg['fields']['use']}", "resultRecordCount": 60}, "scan"), "neighbors")
+        for f in d.get("features", []):
+            if str(f["properties"].get(cfg["pin_field"])) == str(parcel["apn"]): continue
+            g = shape(f["geometry"])
+            if not g.is_empty and g.distance(poly) * 111320 < 60:
+                u = str(f["properties"].get(cfg["fields"]["use"]) or "")
+                scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, u if u and not u.isdigit() else f"code {u}")})
     try:
         scan["pois"] = ls.nearby_pois(c.y, c.x, radius_m=2500)[:5]; log("scan", "Google Places nearby", n=len(scan["pois"]))
     except Exception as e:
@@ -446,11 +551,15 @@ def main():
 
     # 1 parcel
     print("1/7 parcel", flush=True)
-    if a.regrid or not a.county:
-        parcel = ls.fetch_parcel(a.apn, a.path, a.address, a.lat, a.lon); cfg = None
+    sources = json.loads((HERE / "counties.json").read_text()); fed = sources["_federal"]
+    cfg = sources.get(a.county or "regrid")
+    if a.regrid or cfg is None or cfg.get("kind") == "regrid":
+        parcel = ls.fetch_parcel(a.pin or a.apn, a.path, a.address, a.lat, a.lon); cfg = sources["regrid"]
+        c0 = parcel["polygon"].centroid; rg = reverse_geocode(c0.y, c0.x)
+        parcel["county"] = parcel["county"] or rg.get("county", ""); parcel["city"] = parcel["city"] or rg.get("city", "")
+        parcel["use_desc"] = parcel.get("use") or "land"
         log("parcel", "Regrid", apn=parcel["apn"])
     else:
-        cfg = json.loads((HERE / "counties.json").read_text())[a.county]
         parcel = fetch_parcel_county(cfg, a.pin, a.lat, a.lon)
     poly = parcel["polygon"]; c = poly.centroid
     out = Path(a.out or f"out/{parcel['apn']}"); out.mkdir(parents=True, exist_ok=True); (out / "ai").mkdir(exist_ok=True)
@@ -466,11 +575,12 @@ def main():
 
     # 2 scan
     print("2/7 surroundings scan", flush=True)
-    if cfg:
+    if cfg.get("scan") == "county":
         scan = scan_surroundings(cfg, parcel, ref, frame)
     else:
-        scan = {"roads": ls.road_labels(poly), "water": [], "buildings": {}, "flood": {}, "neighbors": [], "pois": ls.nearby_pois(c.y, c.x)[:5], "landcover": landcover_stats(ref, frame, poly)}
+        scan = scan_federal(fed, cfg, parcel, ref, frame)
     desc, forbid = scene_description(parcel, scan)
+    if not parcel.get("acres"): parcel["acres"] = round(ls.acres_from_polygon(poly), 2)
     scan["scene_description"] = desc; scan["forbid"] = forbid
     (out / "scan.json").write_text(json.dumps(scan, indent=2, default=str))
     print("    " + desc)

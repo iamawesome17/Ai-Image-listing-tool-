@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
-COUNTIES = json.loads((HERE / "counties.json").read_text())
+COUNTIES = {k: v for k, v in json.loads((HERE / "counties.json").read_text()).items() if not k.startswith("_")}
 COUNTY_LABELS = {k: v.get("name", k) for k, v in COUNTIES.items()}
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 
@@ -27,7 +27,10 @@ def run(county_label, pin, lat, lon, angles, lights, render, progress=gr.Progres
     if not pin and not (lat and lon):
         raise gr.Error("Enter a parcel number, or both a latitude and a longitude.")
     cmd = [sys.executable, str(HERE / "pipeline.py"), "--county", county, "--angles", angles, "--lights", lights]
-    cmd += ["--pin", pin] if pin else ["--lat", str(lat), "--lon", str(lon)]
+    if COUNTIES[county].get("kind") == "regrid" and pin and ("," in pin or " " in pin.strip()):
+        cmd += ["--address", pin]                      # Regrid: a street address works best
+    else:
+        cmd += ["--pin", pin] if pin else ["--lat", str(lat), "--lon", str(lon)]
     if not render: cmd.append("--no-render")
     progress(0.05, desc="Parcel + surroundings scan…")
     t0 = time.time()
@@ -163,8 +166,8 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             with gr.Column(scale=1, min_width=320):
                 gr.Markdown("### Property")
                 county = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County")
-                pin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
-                gr.Markdown('<div class="help">…or locate by coordinates</div>')
+                pin = gr.Textbox(label="Parcel number (PIN / APN) — or a street address for the Regrid option", placeholder="20-0-0636-002-00")
+                gr.Markdown('<div class="help">Parcel number as shown on the county assessor site. …or locate by coordinates:</div>')
                 with gr.Row():
                     lat = gr.Number(label="Latitude", value=None); lon = gr.Number(label="Longitude", value=None)
                 render = gr.Checkbox(value=True, label="Generate AI drone views (≈ $0.60, 1–2 min)")

@@ -1,38 +1,66 @@
 {
+  "_federal": {
+    "roads": {"url": "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/8", "name": "FULLNAME"},
+    "streams": {"url": "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/6", "name": "gnis_name"},
+    "waterbodies": {"url": "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/12", "name": "gnis_name"},
+    "flood": {"url": "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28", "zone": "FLD_ZONE", "sfha": "SFHA_TF"},
+    "buildings": {"url": "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/USA_Structures_View/FeatureServer/0"}
+  },
+
   "adams-il": {
     "name": "Adams County, IL",
+    "kind": "arcgis",
+    "scan": "county",
     "server": "https://www.adamscountyarcserver.com/adamscountyarcserver/rest/services/Adams_County_Basemap_Complete/MapServer",
-    "layers": {
-      "parcels": 13,
-      "roads": 4,
-      "streams_named": 33,
-      "streams_all": 34,
-      "buildings": 47,
-      "firm_zones": 42,
-      "subdivisions": 15,
-      "quincy_zoning": 25
-    },
+    "parcels_url": "https://www.adamscountyarcserver.com/adamscountyarcserver/rest/services/Adams_County_Basemap_Complete/MapServer/13",
+    "layers": {"parcels": 13, "roads": 4, "streams_named": 33, "streams_all": 34, "buildings": 47, "firm_zones": 42, "subdivisions": 15},
     "pin_field": "PIN",
     "pin_normalize": "digits",
-    "fields": {
-      "situs": "SiteAddress",
-      "acres": "Acres",
-      "owner": "OwnerName",
-      "use": "UseCode",
-      "legal": "LegalDesc",
-      "road_name": "LabelName",
-      "stream_name": "NAME1",
-      "firm_zone": "FLD_ZONE",
-      "firm_sfha": "SFHA_TF"
-    },
+    "fields": {"situs": "SiteAddress", "acres": "Acres", "owner": "OwnerName", "use": "UseCode", "legal": "LegalDesc",
+               "road_name": "LabelName", "stream_name": "NAME1", "firm_zone": "FLD_ZONE", "firm_sfha": "SFHA_TF"},
     "defaults": {"state": "IL", "county": "Adams"},
-    "use_codes": {
-      "11": "farm / agricultural",
-      "21": "farm with residence",
-      "30": "vacant lot",
-      "40": "residential",
-      "50": "commercial",
-      "60": "industrial"
-    }
+    "use_codes": {"11": "farm / agricultural", "21": "farm with residence", "30": "vacant lot", "40": "residential", "50": "commercial", "60": "industrial"}
+  },
+
+  "nc": {
+    "name": "North Carolina (statewide)",
+    "kind": "arcgis",
+    "scan": "federal",
+    "parcels_url": "https://services.nconemap.gov/secure/rest/services/NC1Map_Parcels/MapServer/1",
+    "pin_field": "parno",
+    "pin_normalize": "loose",
+    "fields": {"situs": "siteadd", "acres": "gisacres", "owner": "ownname", "use": "parusedesc", "county": "cntyname"},
+    "defaults": {"state": "NC"}
+  },
+
+  "fl": {
+    "name": "Florida (statewide)",
+    "kind": "arcgis",
+    "scan": "federal",
+    "parcels_url": "https://gis.fdacs.gov/mapping/rest/services/GIO_Parcels_for_OAWP_Optimized/MapServer/0",
+    "pin_field": "PARCEL_ID",
+    "pin_normalize": "loose",
+    "fields": {"owner": "OWN_NAME", "use": "DOR_UC"},
+    "defaults": {"state": "FL"},
+    "reverse_geocode": true
+  },
+
+  "va": {
+    "name": "Virginia (statewide)",
+    "kind": "arcgis",
+    "scan": "federal",
+    "parcels_url": "https://vginmaps.vdem.virginia.gov/arcgis/rest/services/VA_Base_Layers/VA_Parcels/FeatureServer/0",
+    "pin_field": "PARCELID",
+    "pin_normalize": "loose",
+    "fields": {"county": "LOCALITY"},
+    "defaults": {"state": "VA"},
+    "reverse_geocode": true
+  },
+
+  "regrid": {
+    "name": "Any county (Regrid — needs a Regrid API plan)",
+    "kind": "regrid",
+    "scan": "federal",
+    "defaults": {}
   }
 }
