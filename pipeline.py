@@ -100,17 +100,24 @@ def fetch_parcel_county(cfg, pin=None, lat=None, lon=None):
     url = cfg.get("parcels_url") or f"{cfg['server']}/{cfg['layers']['parcels']}"
     F = cfg["fields"]; d = {}
     if pin:
-        for v in pin_variants(pin, cfg.get("pin_normalize", "loose")):
-            d = layer_query(url, {"where": f"{cfg['pin_field']}='{v}'"}, "parcel")
-            if d.get("features"): break
+        vs = list(dict.fromkeys(v for v in pin_variants(pin, cfg.get("pin_normalize", "loose")) if v))
+        d = layer_query(url, {"where": f"{cfg['pin_field']} IN ({','.join(repr(v) for v in vs)})"}, "parcel")
+        if not d.get("features"):                                 # some servers reject IN on text keys: fall back to one-by-one
+            for v in vs:
+                d = layer_query(url, {"where": f"{cfg['pin_field']}='{v}'"}, "parcel")
+                if d.get("features"): break
     else:
         d = layer_query(url, {"geometry": f"{lon},{lat}", "geometryType": "esriGeometryPoint", "inSR": 4326, "spatialRel": "esriSpatialRelIntersects"}, "parcel")
     if not d.get("features"):
         sys.exit(f"No parcel found in {cfg['name']} for that parcel number / point. Check the number as it appears on the county assessor site.")
     f = d["features"][0]; pr = f["properties"]
     g = lambda k: pr.get(F[k]) if k in F else None
+    code = g("county_code"); county = g("county") or (cfg.get("county_codes", {}).get(str(code).strip()) if code is not None else None)
     norm = {"PIN": pr.get(cfg["pin_field"]), "SiteAddress": g("situs"), "Acres": g("acres"), "OwnerName": g("owner"),
-            "UseCode": str(g("use") or ""), "LegalDesc": g("legal"), "county": g("county")}
+            "UseCode": str(g("use") or "").strip(), "LegalDesc": g("legal"), "county": county, "city": g("city"), "zip": str(g("zip") or "")[:5] or None}
+    if not norm["Acres"] and g("land_sqft"):
+        try: norm["Acres"] = round(float(g("land_sqft")) / 43560, 2)
+        except (TypeError, ValueError): pass
     parcel = ls.parcel_from_feature({"geometry": f["geometry"], "properties": norm}, cfg.get("defaults", {}))
     if cfg.get("reverse_geocode") or not parcel["county"] or not parcel["situs"]:
         c = parcel["polygon"].centroid; rg = reverse_geocode(c.y, c.x)
