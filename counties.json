@@ -1,6 +1,9 @@
 {
   "_federal": {
-    "roads": {"url": "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/8", "name": "FULLNAME"},
+    "roads": {"urls": ["https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/2",
+                       "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/3",
+                       "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/8"],
+              "name": "NAME", "_note": "2 = primary roads, 3 = US highways, 8 = local roads; field is NAME (FULLNAME does not exist)"},
     "streams": {"url": "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/6", "name": "gnis_name"},
     "waterbodies": {"url": "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/12", "name": "gnis_name"},
     "flood": {"url": "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28", "zone": "FLD_ZONE", "sfha": "SFHA_TF"},

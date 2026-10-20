@@ -62,9 +62,9 @@ def load_env(path):
         sys.exit("Missing GOOGLE_MAPS_KEY (set env var or --env file)")
 
 
-def http_json(url, data=None, headers=None):
-    req = urllib.request.Request(url, data=data, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=40) as r:
+def http_json(url, data=None, headers=None, timeout=40):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "bana-listing-tool/1.0", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 

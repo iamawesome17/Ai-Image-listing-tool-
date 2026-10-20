@@ -21,7 +21,7 @@ Options:
   --no-render                    stop after phase 1
   --out DIR                      default out/<pin>
 """
-import argparse, json, math, os, sys, time, uuid, io, urllib.request, urllib.parse, zipfile, shutil
+import argparse, re, json, math, os, sys, time, uuid, io, urllib.request, urllib.parse, zipfile, shutil
 from pathlib import Path
 
 import numpy as np, cv2
@@ -46,9 +46,9 @@ def log(stage, what, **kw):
     print(f"  [{stage}] {what}" + (f"  {kw}" if kw else ""), flush=True)
 
 
-def getjson(url, stage, **kw):
+def getjson(url, stage, timeout=40, **kw):
     log(stage, "GET " + url.split("?")[0], **kw)
-    return ls.http_json(url)
+    return ls.http_json(url, timeout=timeout)
 
 
 # ---------- 1. parcel ----------
@@ -58,10 +58,10 @@ def county_query(cfg, layer, params, stage="gis"):
     return getjson(base + urllib.parse.urlencode(q), stage, layer=layer)
 
 
-def layer_query(url, params, stage="gis", fmt="geojson"):
+def layer_query(url, params, stage="gis", fmt="geojson", timeout=40):
     """Query any ArcGIS feature/map layer URL (…/MapServer/13 or …/FeatureServer/0)."""
     q = {"f": fmt, "outSR": 4326, "returnGeometry": "true", "outFields": "*", **params}
-    return getjson(url.rstrip("/") + "/query?" + urllib.parse.urlencode(q), stage)
+    return getjson(url.rstrip("/") + "/query?" + urllib.parse.urlencode(q), stage, timeout=timeout)
 
 
 def pin_variants(pin, mode):
@@ -128,6 +128,16 @@ def bearing(c, p):
     return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((b + 22.5) // 45) % 8]
 
 
+def road_title(name):
+    """Title-case a road name but keep highway designators (US 421 S, NC 42, SR 1234, CR 12, I-70)."""
+    keep = {"US", "NC", "SC", "VA", "FL", "MO", "IL", "SR", "CR", "FM", "RR", "NE", "NW", "SE", "SW", "N", "S", "E", "W"}
+    out = []
+    for w in name.split():
+        u = w.upper()
+        out.append(u if u in keep or re.fullmatch(r"I-\d+|[A-Z]{1,2}-?\d+[A-Z]?", u) else w.title())
+    return " ".join(out)
+
+
 def meters(a, b):
     return math.hypot((a.x - b.x) * 111320 * math.cos(math.radians(a.y)), (a.y - b.y) * 110540)
 
@@ -167,7 +177,7 @@ def scan_surroundings(cfg, parcel, sat_wide, frame_wide):
         d = min(meters(Point(p), poly.exterior.interpolate(poly.exterior.project(Point(p)))) for p in (g.coords if isinstance(g, LineString) else [q for l in g.geoms for q in l.coords]))
         near = g.interpolate(g.project(c)) if isinstance(g, LineString) else min((l.interpolate(l.project(c)) for l in g.geoms), key=lambda p: meters(p, c))
         lines = [g] if isinstance(g, LineString) else list(g.geoms)
-        scan["roads"].append({"name": name.title(), "side": bearing(c, near), "distance_m": round(d), "adjacent": d < 25,
+        scan["roads"].append({"name": road_title(name), "side": bearing(c, near), "distance_m": round(d), "adjacent": d < 25,
                               "label_lon": near.x, "label_lat": near.y,
                               "geometry": [[[round(x, 6), round(y, 6)] for x, y, *_ in l.coords] for l in lines]})
     # dedupe by name keeping the closest
@@ -231,16 +241,18 @@ def scan_federal(fed, cfg, parcel, sat_wide, frame_wide):
     def safe(fn, what):
         try: return fn()
         except Exception as e: log("scan", f"{what} unavailable", err=str(e)[:80]); return {}
-    # roads
-    d = safe(lambda: layer_query(fed["roads"]["url"], envq, "scan"), "TIGER roads")
-    for f in d.get("features", []):
-        g = shape(f["geometry"]); name = (f["properties"].get(fed["roads"]["name"]) or "").strip()
-        if not name or g.is_empty: continue
-        lines = [g] if isinstance(g, LineString) else list(getattr(g, "geoms", []))
-        near = min((l.interpolate(l.project(c)) for l in lines), key=lambda p: meters(p, c))
-        dist = min(meters(Point(q), poly.exterior.interpolate(poly.exterior.project(Point(q)))) for l in lines for q in l.coords)
-        scan["roads"].append({"name": name.title(), "side": bearing(c, near), "distance_m": round(dist), "adjacent": dist < 25,
-                              "label_lon": near.x, "label_lat": near.y, "geometry": [[[round(x, 6), round(y, 6)] for x, y, *_ in l.coords] for l in lines]})
+    # roads — TIGERweb splits roads across layers (primary / secondary / local); query each, lean fields, short timeout
+    rname = fed["roads"]["name"]
+    for url in fed["roads"].get("urls") or [fed["roads"]["url"]]:
+        d = safe(lambda: layer_query(url, {**envq, "outFields": rname}, "scan", timeout=25), "TIGER roads")
+        for f in d.get("features", []):
+            g = shape(f["geometry"]); name = (f["properties"].get(rname) or "").strip()
+            if not name or g.is_empty: continue
+            lines = [g] if isinstance(g, LineString) else list(getattr(g, "geoms", []))
+            near = min((l.interpolate(l.project(c)) for l in lines), key=lambda p: meters(p, c))
+            dist = min(meters(Point(q), poly.exterior.interpolate(poly.exterior.project(Point(q)))) for l in lines for q in l.coords)
+            scan["roads"].append({"name": road_title(name), "side": bearing(c, near), "distance_m": round(dist), "adjacent": dist < 25,
+                                  "label_lon": near.x, "label_lat": near.y, "geometry": [[[round(x, 6), round(y, 6)] for x, y, *_ in l.coords] for l in lines]})
     best = {}
     for r in scan["roads"]:
         if r["name"] not in best: best[r["name"]] = r
@@ -250,7 +262,7 @@ def scan_federal(fed, cfg, parcel, sat_wide, frame_wide):
     scan["roads"] = sorted(best.values(), key=lambda r: r["distance_m"])
     # water: streams + waterbodies
     for key, label in (("streams", "creek"), ("waterbodies", "pond")):
-        d = safe(lambda: layer_query(fed[key]["url"], envq, "scan"), f"NHD {key}")
+        d = safe(lambda: layer_query(fed[key]["url"], {**envq, "outFields": fed[key]["name"]}, "scan", timeout=25), f"NHD {key}")
         for f in d.get("features", []):
             g = shape(f["geometry"]); name = (f["properties"].get(fed[key]["name"]) or "").strip()
             if g.is_empty: continue
@@ -259,22 +271,23 @@ def scan_federal(fed, cfg, parcel, sat_wide, frame_wide):
                 scan["water"].append({"name": name.title() or f"unnamed {label}", "crosses_parcel": crosses, "distance_m": dist, "side": bearing(c, g.centroid)})
     seen = set(); scan["water"] = [w for w in scan["water"] if not (w["name"] in seen or seen.add(w["name"]))]
     # buildings
-    d = safe(lambda: layer_query(fed["buildings"]["url"], {**envq, "outFields": "OBJECTID"}, "scan"), "USA Structures")
+    d = safe(lambda: layer_query(fed["buildings"]["url"], {**envq, "outFields": "OBJECTID"}, "scan", timeout=25), "USA Structures")
     bl = d.get("features", []); inside = [f for f in bl if shape(f["geometry"]).intersects(poly)]
     scan["buildings"] = {"layer_features_nearby": len(bl), "inside_parcel": len(inside), "coverage_note": "USA Structures (nationwide footprints)"}
     # flood
-    d = safe(lambda: layer_query(fed["flood"]["url"], {**envq, "outFields": f"{fed['flood']['zone']},{fed['flood']['sfha']}"}, "scan"), "FEMA NFHL")
+    d = safe(lambda: layer_query(fed["flood"]["url"], {**envq, "outFields": f"{fed['flood']['zone']},{fed['flood']['sfha']}"}, "scan", timeout=25), "FEMA NFHL")
     fz = [{"zone": f["properties"].get(fed["flood"]["zone"]), "sfha": f["properties"].get(fed["flood"]["sfha"])} for f in d.get("features", []) if shape(f["geometry"]).intersects(poly)]
     scan["flood"] = {"zones_touching_parcel": fz}
     # neighbors from the same parcel layer
     if cfg.get("parcels_url") and "use" in cfg["fields"]:
-        d = safe(lambda: layer_query(cfg["parcels_url"], {**envq, "outFields": f"{cfg['pin_field']},{cfg['fields']['use']}", "resultRecordCount": 60}, "scan"), "neighbors")
+        d = safe(lambda: layer_query(cfg["parcels_url"], {**envq, "outFields": f"{cfg['pin_field']},{cfg['fields']['use']}", "resultRecordCount": 60}, "scan", timeout=25), "neighbors")
         for f in d.get("features", []):
             if str(f["properties"].get(cfg["pin_field"])) == str(parcel["apn"]): continue
             g = shape(f["geometry"])
             if not g.is_empty and g.distance(poly) * 111320 < 60:
-                u = str(f["properties"].get(cfg["fields"]["use"]) or "")
-                scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, u if u and not u.isdigit() else f"code {u}")})
+                u = str(f["properties"].get(cfg["fields"]["use"]) or "").strip()
+                if not u: continue                                   # no use recorded → nothing useful to say
+                scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, u.lower() if not u.isdigit() else f"use code {u}")})
     try:
         scan["pois"] = ls.nearby_pois(c.y, c.x, radius_m=2500)[:5]; log("scan", "Google Places nearby", n=len(scan["pois"]))
     except Exception as e:
@@ -287,19 +300,34 @@ def scan_federal(fed, cfg, parcel, sat_wide, frame_wide):
 def osm_powerlines(poly, pad=0.004):
     """OpenStreetMap power lines near the parcel (Overpass). Returns [] when unreachable or none mapped."""
     minx, miny, maxx, maxy = poly.bounds
-    q = f'[out:json][timeout:20];way["power"~"line|minor_line"]({miny-pad},{minx-pad},{maxy+pad},{maxx+pad});out geom;'
-    try:
-        d = ls.http_json("https://overpass-api.de/api/interpreter?" + urllib.parse.urlencode({"data": q}))
-        lines = [[[n["lon"], n["lat"]] for n in w.get("geometry", [])] for w in d.get("elements", [])]
-        log("scan", "OSM power lines", n=len(lines)); return [l for l in lines if len(l) >= 2]
-    except Exception as e:
-        log("scan", "OSM power lines unavailable (allow overpass-api.de)", err=str(e)[:60]); return []
+    q = f'[out:json][timeout:15];way["power"~"line|minor_line"]({miny-pad},{minx-pad},{maxy+pad},{maxx+pad});out geom;'
+    body = urllib.parse.urlencode({"data": q}).encode()
+    errs = []
+    for host in OVERPASS_HOSTS:                                   # the main server is often at capacity (502) → try mirrors
+        try:
+            d = ls.http_json(f"https://{host}/api/interpreter", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=20)
+            lines = [[[n["lon"], n["lat"]] for n in w.get("geometry", [])] for w in d.get("elements", [])]
+            log("scan", "OSM power lines", host=host, n=len(lines)); return [l for l in lines if len(l) >= 2]
+        except Exception as e:
+            errs.append(f"{host}: {str(e)[:40]}")
+    log("scan", "OSM power lines unavailable", err="; ".join(errs)[:160]); return []
+
+
+OVERPASS_HOSTS = ["overpass-api.de", "overpass.private.coffee", "overpass.kumi.systems"]
+REGION = {**dict.fromkeys("IL IN IA KS MI MN MO NE ND OH SD WI".split(), "rural Midwestern"),
+          **dict.fromkeys("NC SC GA FL AL MS TN KY AR LA".split(), "rural Southeastern US"),
+          **dict.fromkeys("VA WV MD DE PA NJ NY".split(), "rural Mid-Atlantic"),
+          **dict.fromkeys("TX OK NM AZ".split(), "rural Southwestern US"),
+          **dict.fromkeys("CO WY MT ID UT NV".split(), "rural Mountain West"),
+          **dict.fromkeys("WA OR CA".split(), "rural West Coast"),
+          **dict.fromkeys("ME NH VT MA CT RI".split(), "rural New England")}
 
 
 def scene_description(parcel, scan):
     """Plain-English scene facts for the prompt + a do-not-invent list."""
     lc = scan.get("landcover", {})
-    parts = [f"a {parcel['acres']:.1f}-acre parcel, {parcel.get('use_desc', 'land')}, in a rural Midwestern setting"]
+    region = REGION.get((parcel.get("state") or "").upper(), "rural US")
+    parts = [f"a {parcel['acres']:.1f}-acre parcel, {parcel.get('use_desc', 'land')}, in a {region} setting"]
     if lc:
         dom = max(lc, key=lambda k: lc[k] if k != "pixels" else -1)
         words = {"tree_canopy": "mostly wooded with mature tree canopy", "open_green": "mostly open green pasture or lawn",
