@@ -392,11 +392,11 @@ def draw_poi(img, xy, name, kind):
     return True
 
 
-def draw_disclaimer(img, text=DISCLAIMER, size=24):
+def draw_disclaimer(img, text=DISCLAIMER, size=24, bottom=70):
     d = ImageDraw.Draw(img)
     f = font(size)
     w = d.textlength(text, font=f)
-    x, y = img.width - 28 - w, img.height - 70 - size - 8   # sits above Google's attribution strip
+    x, y = img.width - 28 - w, img.height - bottom - size - 8   # bottom=70 sits above Google's attribution strip
     for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2), (0, 3)]:
         d.text((x + dx, y + dy), text, font=f, fill=(0, 0, 0, 200))
     d.text((x, y), text, font=f, fill=(255, 255, 255, 255))

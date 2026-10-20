@@ -18,6 +18,10 @@ sys.path.insert(0, str(HERE))
 COUNTIES = {k: v for k, v in json.loads((HERE / "counties.json").read_text()).items() if not k.startswith("_")}
 COUNTY_LABELS = {k: v.get("name", k) for k, v in COUNTIES.items()}
 PASSWORD = os.environ.get("APP_PASSWORD", "")
+try:
+    import listing_shot as _ls; _ls.load_env(str(HERE / ".env"))          # local runs: keys from .env / keys.env; Railway: env vars
+except Exception:
+    pass
 EDITOR_JS = (HERE / "editor.js").read_text()
 
 VIEW_NAMES = {"nadir": "Overhead", "S": "From the south", "N": "From the north", "E": "From the east", "W": "From the west",
@@ -224,8 +228,10 @@ def run_photo(path, work, county_label, pin, boundary, label, golden, pts, progr
         z = ls.choose_zoom(poly, 640, 480, margin=0.22); fr = ls.Frame(c.y, c.x, z, 640, 480)
         fed = json.loads((HERE / "counties.json").read_text())["_federal"]
         scan = P.scan_surroundings(cfg, parcel, ls.fetch_satellite(fr), fr) if cfg.get("scan") == "county" else P.scan_federal(fed, cfg, parcel, ls.fetch_satellite(fr), fr)
-    except Exception:
-        scan = None
+    except Exception as e:
+        scan = None; scan_err = str(e)[:200]
+    else:
+        scan_err = None
     points = [tuple(p) for p in pts] if pts and len(pts) >= 3 else None
     progress(0.4, desc="Golden-hour relight (≈1 min)…" if golden else "Drawing lines…")
     try:
@@ -233,9 +239,12 @@ def run_photo(path, work, county_label, pin, boundary, label, golden, pts, progr
     except RuntimeError as e:
         raise gr.Error(str(e))
     note = f"Property line from **{r['source']}**."
+    if r["source"] == "placed for dragging":
+        note = "**No metadata and no corners** — the true parcel shape was placed in the middle of the photo. Open **Review & edit**, drag at least 4 corners onto the real corners, and Apply: the whole shape and the callouts snap into place."
     if r.get("meta"):
         m = r["meta"]; note += f" Camera: {m['model'] or 'drone'}, {m['alt_m']:.0f} m up, heading {m['yaw']:.0f}°, tilt {m['pitch']:.0f}°."
     note += (" Callouts placed from the ground fit." if r.get("ground_map") else " No ground fit (corners only) — boundary and card drawn, no callouts.")
+    if scan_err: note += f" ⚠️ Surroundings scan failed ({scan_err}) — no automatic callouts."
     note += " Check the line against what you know of the property, then use **Review & edit** to adjust."
     return [(f, Path(f).stem.replace("_", " ")) for f in r["files"]], note, r["out_dir"], r.get("zip")
 
@@ -371,7 +380,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                 ezip = gr.File(label="Download packet (zip)", scale=1)
             eload.click(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
             ekey.change(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-            eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js="(o, k, e) => [o, k, JSON.stringify(window.banaEditor.export())]")
+            eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js="(o, k, e) => [o, k, JSON.stringify(window.banaEditor.export())]").then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
             ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
             erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
             eruns.change(pick_run, [eruns], [ekey, run_dir])

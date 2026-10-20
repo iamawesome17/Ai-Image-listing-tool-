@@ -113,28 +113,62 @@ def metadata_debug(path):
     return "; ".join(bits)
 
 
+def simplify_to_n(ring, n):
+    """Visvalingam: drop the vertex with the smallest triangle area until exactly n remain."""
+    pts = list(ring)
+    while len(pts) > n:
+        m = len(pts); best, bi = None, None
+        for i in range(m):
+            a, b, c = pts[i - 1], pts[i], pts[(i + 1) % m]
+            area = abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
+            if best is None or area < best: best, bi = area, i
+        pts.pop(bi)
+    return pts
+
+
 def ground_map_from_clicks(poly, clicks, W, H):
-    """Ground map from corners the user clicked (in order around the boundary). The parcel polygon is simplified to the same
-    number of corners, matched by cyclic shift/direction, and a homography is fitted. Returns (PlaneMap or None, error)."""
+    """Ground map from corners the user clicked (in order around the boundary). The parcel polygon is reduced to the same
+    number of corners, matched by cyclic shift/direction, and a homography is fitted. Falls back to a rough bbox map.
+    Returns (PlaneMap, note, rough:bool)."""
     import layout as L
     n = len(clicks)
-    if n < 4: return None, "need 4+ corners"
     ring = [(x, y) for x, y, *_ in poly.exterior.coords][:-1]
-    # simplify the polygon down to n vertices
-    eps = 1e-6; simp = ring
-    while len(simp) > n and eps < 1e-2:
-        simp = [(x, y) for x, y, *_ in poly.simplify(eps).exterior.coords][:-1]; eps *= 1.5
-    if len(simp) != n: return None, f"parcel has {len(simp)} corners, {n} clicked"
     best = None
-    for rev in (False, True):
-        seq = simp[::-1] if rev else simp
-        for k in range(n):
-            cand = seq[k:] + seq[:k]
-            pm = L.PlaneMap.fit(cand, clicks, W, H)
-            if pm and (best is None or pm.error < best[0]): best = (pm.error, pm)
-    if best is None: return None, "fit failed"
-    pm = best[1]
-    return (pm if pm.error < 0.02 * W else None), f"{pm.error:.1f} px"
+    if n >= 4 and len(ring) >= n:
+        simp = simplify_to_n(ring, n)
+        for rev in (False, True):
+            seq = simp[::-1] if rev else simp
+            for k in range(n):
+                cand = seq[k:] + seq[:k]
+                pm = L.PlaneMap.fit(cand, clicks, W, H)
+                if pm and (best is None or pm.error < best.error): best = pm
+    if best is not None and best.error < 0.025 * W and _sane(best, ring, clicks):
+        return best, f"corner fit {best.error:.1f} px", False
+    # rough fallback: parcel bbox → clicked bbox (keeps the editor and the card usable; auto callouts are hidden)
+    xs, ys = zip(*ring); cx, cy = zip(*clicks)
+    src = [(min(xs), min(ys)), (max(xs), min(ys)), (max(xs), max(ys)), (min(xs), max(ys))]
+    dst = [(min(cx), max(cy)), (max(cx), max(cy)), (max(cx), min(cy)), (min(cx), min(cy))]
+    pm = L.PlaneMap.fit(src, dst, W, H)
+    return pm, "rough bbox map" + (f" (corner fit {best.error:.0f} px rejected)" if best is not None else ""), True
+
+
+def _sane(pm, ring, clicks):
+    """A homography that puts part of the parcel behind the camera, or wildly rescales it, is not a camera."""
+    import numpy as np
+    from shapely.geometry import Polygon
+    ws = []
+    for x, y in ring:
+        mx, my = L_metric(pm, x, y); v = pm.H @ np.array([mx, my, 1.0]); ws.append(v[2])
+    if min(ws) <= 0 or not np.isfinite(pm.H).all(): return False
+    mapped = Polygon([pm.to_px(x, y) for x, y in ring]).buffer(0); clicked = Polygon(clicks).buffer(0)
+    if mapped.is_empty or clicked.is_empty: return False
+    r = mapped.area / clicked.area
+    return 0.6 < r < 1.7
+
+
+def L_metric(pm, lon, lat):
+    import layout as L
+    return L._metric(lon, lat, pm.origin)
 
 
 def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref_url=None, meta_path=None):
@@ -149,22 +183,36 @@ def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref
     if img.width > 1600:
         k = 1600 / img.width; img = img.resize((1600, round(img.height * k)), Image.LANCZOS)
         if pts: pts = [(x * k, y * k) for x, y in pts]
-    if not pts:
-        raise RuntimeError("No property line: the photo has no usable DJI metadata — click the corners in the UI.")
     stem = Path(photo_path).stem.replace("_work", "")
     out_dir = Path(out_dir or f"out/{parcel['apn']}/photos") / stem; out_dir.mkdir(parents=True, exist_ok=True)
     poly = parcel["polygon"]
     # ground map: exact from metadata (pinhole + flat ground = homography), or fitted from the clicked corners
-    if source.startswith("DJI"):
+    rough = False
+    ring_full = [(x, y) for x, y, *_ in poly.exterior.coords][:-1]
+    ring = simplify_to_n(ring_full, 14) if len(ring_full) > 14 else ring_full          # draggable in the editor
+    if not pts:                                                                       # nothing to go on: drop the true shape in the middle, user drags the corners
+        source = "placed for dragging"
+        import layout as L
+        xs, ys = zip(*ring); W, H = img.width, img.height
+        src = [(min(xs), min(ys)), (max(xs), min(ys)), (max(xs), max(ys)), (min(xs), max(ys))]
+        sw, sh = (max(xs) - min(xs)) * 111320 * math.cos(math.radians(poly.centroid.y)), (max(ys) - min(ys)) * 110540
+        k = min(0.6 * W / max(sw, 1), 0.5 * H / max(sh, 1)); bw, bh = sw * k, sh * k; cx, cy = W / 2, H * 0.58
+        dst = [(cx - bw / 2, cy + bh / 2), (cx + bw / 2, cy + bh / 2), (cx + bw / 2, cy - bh / 2), (cx - bw / 2, cy - bh / 2)]
+        pm = L.PlaneMap.fit(src, dst, W, H); pts = [pm.to_px(x, y) for x, y in ring]; fit_note = "not fitted yet"; rough = True
+    elif source.startswith("DJI"):
         ll = [(x, y) for x, y, *_ in poly.exterior.coords][:-1]
         pm = L.PlaneMap.fit(ll, pts[:len(ll)], img.width, img.height); fit_note = "metadata"
     else:
-        pm, fit_note = ground_map_from_clicks(poly, [tuple(p) for p in pts], img.width, img.height)
+        pm, fit_note, rough = ground_map_from_clicks(poly, [tuple(p) for p in pts], img.width, img.height)
+        if pm and not rough:                                   # good fit: draw the true parcel shape (every jog), not just the clicked corners
+            pts = [pm.to_px(x, y) for x, y in ring]
     layout = L.build_layout(parcel, scan or {"roads": [], "water": [], "buildings": {}, "neighbors": []})
+    layout["boundary"] = [[x, y] for x, y in ring]                                       # same vertices as boundary_px (editor drags map 1:1)
+    if source.startswith("DJI"): pts = [pm.to_px(x, y) for x, y in ring]
     maps = {"_meta": {"model": "photo", "angles": [], "lights": [], "low": [], "photo": stem}}
     img.convert("RGB").save(out_dir / "photo_original_clean.jpg", quality=94)
     maps["photo_original"] = {"src": "photo_original_clean.jpg", "kind": "photo", "boundary_px": [list(p) for p in pts], "map": pm.to_json() if pm else None,
-                              "source": source, "fit": fit_note, "meta": meta}
+                              "source": source, "fit": fit_note, "meta": meta, "rough": rough}
     if golden:
         relit = relight_golden(img, pts, ref_url)
         if relit.size != img.size: relit = relit.resize(img.size, Image.LANCZOS)
@@ -176,14 +224,14 @@ def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref
         else:
             clean, relit_pts = relit, pts
         clean.convert("RGB").save(out_dir / "photo_golden_clean.jpg", quality=94)
-        maps["photo_golden"] = {"src": "photo_golden_clean.jpg", "kind": "photo", "boundary_px": [list(p) for p in relit_pts], "map": pm.to_json() if pm else None, "source": source}
+        maps["photo_golden"] = {"src": "photo_golden_clean.jpg", "kind": "photo", "boundary_px": [list(p) for p in relit_pts], "map": pm.to_json() if pm else None, "source": source, "rough": rough}
     (out_dir / "parcel.geojson").write_text(json.dumps({"type": "Feature", "geometry": poly.__geo_interface__, "properties": {}}))
     (out_dir / "scan.json").write_text(json.dumps(scan or {}, indent=1, default=str))
     (out_dir / "layout.json").write_text(json.dumps(layout, indent=1))
     P.save_state(out_dir, parcel, maps)
     zp, n = P.finalize(out_dir)
     files = sorted(str(p) for p in out_dir.glob("photo_*_with_lines.jpg")) + ([str(out_dir / "photo_golden_clean.jpg")] if golden else [])
-    return {"source": source, "meta": meta, "points": pts, "files": files, "out_dir": str(out_dir), "zip": str(zp), "fit": fit_note, "ground_map": bool(pm)}
+    return {"source": source, "meta": meta, "points": pts, "files": files, "out_dir": str(out_dir), "zip": str(zp), "fit": fit_note, "ground_map": bool(pm) and not rough}
 
 
 if __name__ == "__main__":

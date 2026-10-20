@@ -215,11 +215,14 @@ def _s(img, base=1200.0): return max(0.6, min(2.2, img.width / base))
 def draw_card(img, gmap, layout, parcel, scale):
     cx, cy = gmap.to_px(layout["card"]["lon"], layout["card"]["lat"])
     cx = min(max(cx, 0.12 * img.width), 0.88 * img.width); cy = min(max(cy, 0.2 * img.height), 0.95 * img.height)
-    pole_top = (cx, max(0.30 * img.height, cy - min(260 * scale, img.height * 0.22)))
+    lines, sizes, pad = [layout["card"]["title"], layout["card"]["sub"]], [int(58 * scale), int(24 * scale)], (int(22 * scale), int(14 * scale))
+    (bx0, by0, bx1, by1), _, _ = ls.measure_box(img, (cx, 0), lines, sizes, pad, "top"); box_h = by1 - by0; box_w = bx1 - bx0
+    pin_r = int(24 * scale); top_need = 2.6 * pin_r + box_h + 16 * scale                   # pin + card must stay inside the frame
+    pole_top = (cx, max(0.30 * img.height, top_need, cy - min(260 * scale, img.height * 0.22)))
+    cx = min(max(cx, box_w / 2 + 6), img.width - box_w / 2 - 6)                             # card fully on-frame horizontally
     ls.draw_pole(img, pole_top, (cx, cy), width=max(3, int(5 * scale)))
-    box = ls.text_box(img, (cx, pole_top[1] - 10 * scale), [layout["card"]["title"], layout["card"]["sub"]], [int(58 * scale), int(24 * scale)],
-                      pad=(int(22 * scale), int(14 * scale)), radius=int(14 * scale), anchor="bottom")
-    ls.draw_pin(img, (cx, box[1] - 6), r=int(24 * scale))
+    box = ls.text_box(img, (cx, pole_top[1] - 10 * scale), lines, sizes, pad=pad, radius=int(14 * scale), anchor="bottom")
+    ls.draw_pin(img, (cx, box[1] - 6), r=pin_r)
 
 
 def _place(img, xy, lines, sizes, pad, scale, lead0=58):
@@ -272,7 +275,7 @@ def draw_road(img, xy, text, scale):
     ls.text_box(img, (bx, by), lines, sizes, pad=pad, radius=int(9 * scale), anchor=mode, bg=ROAD_STYLE["bg"], fg=ROAD_STYLE["fg"])
 
 
-def render(img, gmap, layout, parcel, pois=(), boundary_px=None, show_card=True, show_labels=True):
+def render(img, gmap, layout, parcel, pois=(), boundary_px=None, show_card=True, show_labels=True, attribution=False):
     """Draw the full layout on an RGBA image using its ground map. boundary_px overrides the mapped polygon (e.g. detected marker)."""
     out = img.copy(); scale = _s(out); ls.PLACED.clear()
     pts = boundary_px or [gmap.to_px(x, y) for x, y in layout["boundary"]]
@@ -293,7 +296,7 @@ def render(img, gmap, layout, parcel, pois=(), boundary_px=None, show_card=True,
             x, y = gmap.to_px(p["lon"], p["lat"])
             if inside(x, y, 140) and not Polygon(layout["boundary"]).contains(Point(p["lon"], p["lat"])):
                 ls.draw_poi(out, (x, y), p["name"], p["type"])
-    ls.draw_disclaimer(out, layout.get("disclaimer", ls.DISCLAIMER), size=int(24 * scale))
+    ls.draw_disclaimer(out, layout.get("disclaimer", ls.DISCLAIMER), size=int(24 * scale), bottom=70 if attribution else int(26 * scale))
     return out
 
 
@@ -305,19 +308,26 @@ def layout_px(layout, gmap):
             "disclaimer": layout.get("disclaimer", ls.DISCLAIMER)}
 
 
-def apply_px_edits(layout, edits, gmap):
-    """Fold pixel-space edits from the editor back into the ground layout. edits = {boundary:[[x,y]..] | None, card:{title,sub,x,y}, labels:[{id,kind,text,sub,x,y}], disclaimer}"""
+def apply_px_edits(layout, edits, gmap, shown=None, tol=1.5):
+    """Fold pixel-space edits from the editor back into the ground layout. edits = {boundary:[[x,y]..] | None, card:{title,sub,x,y}, labels:[{id,kind,text,sub,x,y}], disclaimer}
+    shown: the pixel layout the editor was given (layout_px); items the user did not move keep their original ground position."""
     new = json.loads(json.dumps(layout))
+    shown_lab = {l["id"]: (l["x"], l["y"]) for l in (shown or {}).get("labels", [])}
+    unmoved = lambda a, b: a is not None and math.hypot(a[0] - b[0], a[1] - b[1]) <= tol
     if edits.get("boundary"):
         new["boundary"] = [list(gmap.to_ll(x, y)) for x, y in edits["boundary"]]
     if edits.get("card"):
-        cd = edits["card"]; lon, lat = gmap.to_ll(cd["x"], cd["y"])
+        cd = edits["card"]
+        if shown and unmoved((shown["card"]["x"], shown["card"]["y"]), (cd["x"], cd["y"])): lon, lat = layout["card"]["lon"], layout["card"]["lat"]
+        else: lon, lat = gmap.to_ll(cd["x"], cd["y"])
         new["card"] = {"title": cd.get("title", layout["card"]["title"]), "sub": cd.get("sub", layout["card"]["sub"]), "lon": lon, "lat": lat}
     if "labels" in edits:
-        labs = []
+        orig = {l["id"]: l for l in layout["labels"]}; labs = []
         for l in edits["labels"]:
-            lon, lat = gmap.to_ll(l["x"], l["y"])
-            labs.append({"id": l.get("id") or f"u{len(labs)}", "kind": l.get("kind", "feature"), "text": l.get("text", ""), "sub": l.get("sub", ""), "lon": lon, "lat": lat})
+            lid = l.get("id") or f"u{len(labs)}"
+            if lid in orig and unmoved(shown_lab.get(lid), (l["x"], l["y"])): lon, lat = orig[lid]["lon"], orig[lid]["lat"]
+            else: lon, lat = gmap.to_ll(l["x"], l["y"])
+            labs.append({"id": lid, "kind": l.get("kind", "feature"), "text": l.get("text", ""), "sub": l.get("sub", ""), "lon": lon, "lat": lat})
         new["labels"] = labs
     if "disclaimer" in edits: new["disclaimer"] = edits["disclaimer"]
     return new

@@ -344,7 +344,7 @@ def osm_features(scan, poly, pad=0.004):
     errs = []
     for host in OVERPASS_HOSTS:                                   # the main server is often at capacity (502) → try mirrors
         try:
-            d = ls.http_json(f"https://{host}/api/interpreter", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=20)
+            d = ls.http_json(f"https://{host}/api/interpreter", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=8)
             for w in d.get("elements", []):
                 line = [[n["lon"], n["lat"]] for n in w.get("geometry", [])]
                 if len(line) < 2: continue
@@ -900,11 +900,14 @@ def draw_one(out, key, rec, parcel, layout, scan, variant=""):
     img, gmap, bpx = prepare(out, key, rec, layout, variant)
     if img is None: return None
     if rec["kind"] == "satellite":
-        return L.render(img, gmap, layout, parcel, pois=scan.get("pois", [])[:3] if rec.get("pois") else [])
+        return L.render(img, gmap, layout, parcel, pois=scan.get("pois", [])[:3] if rec.get("pois") else [], attribution=True)
     if rec["kind"] == "photo" and gmap is None:                 # corners only: boundary + card at the polygon centre
         class _C:
             def to_px(self_, lon, lat): return (sum(p[0] for p in bpx) / len(bpx), sum(p[1] for p in bpx) / len(bpx))
         return L.render(img, _C(), layout, parcel, boundary_px=bpx, show_labels=False)
+    if rec.get("rough"):                                         # rough map: only labels the user placed in the editor
+        lay2 = dict(layout); lay2["labels"] = [l for l in layout["labels"] if str(l.get("id", "")).startswith("u")]
+        return L.render(img, gmap, lay2, parcel, boundary_px=bpx)
     if gmap is None:                                            # weak fit: boundary + card only, no feature callouts
         class _M:
             def to_px(self_, lon, lat): return (sum(p[0] for p in bpx) / len(bpx), sum(p[1] for p in bpx) / len(bpx))
@@ -927,8 +930,27 @@ def apply_edits(out, key, edits, variant=""):
     """Fold editor output (pixel space of `key`) into layout.json, then rebuild everything. Returns (zip, n)."""
     out = Path(out); parcel, layout, maps, scan = load_state(out)
     rec = maps[key]; img, gmap, bpx = prepare(out, key, rec, layout, variant)
-    new = L.apply_px_edits(layout, edits, gmap)
+    refit = None
+    if rec["kind"] == "photo" and edits.get("boundary_edited") and len(edits.get("boundary", [])) == len(layout["boundary"]):
+        # dragged corners ↔ parcel vertices are exact correspondences → fit the real ground map from the moved ones
+        old = rec.get("boundary_px") or []
+        moved = [i for i, (q, o) in enumerate(zip(edits["boundary"], old)) if math.hypot(q[0] - o[0], q[1] - o[1]) > 2.5] if len(old) == len(edits["boundary"]) else []
+        if len(moved) >= 4:
+            ll = [tuple(layout["boundary"][i]) for i in moved]; px = [tuple(edits["boundary"][i]) for i in moved]
+            pm = L.PlaneMap.fit(ll, px, img.width, img.height, ransac=8.0 if len(moved) >= 6 else 0.0)
+            import drone_photo as D
+            if pm and D._sane(pm, [tuple(v) for v in layout["boundary"]], px): refit = pm
+            log("edit", "ground map refit from dragged corners", moved=len(moved), ok=bool(refit), err=round(pm.error, 1) if pm else None)
+    shown = L.layout_px(layout, gmap) if gmap else None
+    new = L.apply_px_edits(layout, edits, refit or gmap, shown)
     if edits.get("boundary_edited"): new["boundary_edited"] = True
+    if refit:
+        for k2, r2 in maps.items():
+            if not k2.startswith("_") and r2["kind"] == "photo":
+                r2["map"] = refit.to_json(); r2["rough"] = False; r2["fit"] = f"fit from dragged corners, {refit.error:.1f} px"
+                r2["boundary_px"] = [list(refit.to_px(x, y)) for x, y in layout["boundary"]]
+        new["boundary"] = layout["boundary"]; new["boundary_edited"] = False
+        (out / "maps.json").write_text(json.dumps(maps, indent=1))
     if edits.get("card"):
         t = edits["card"].get("title", "")
         import re as _re
