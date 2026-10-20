@@ -5,7 +5,12 @@ from multiple compass angles, each with the property line, pin, acreage card and
 
     python pipeline.py --county adams-il --pin 20-0-0636-002-00
     python pipeline.py --county adams-il --lat 39.91722 --lon -91.2892
+    python pipeline.py --county nc --pin 0096341                             # statewide layers: nc, fl, va
+    python pipeline.py --boundary parcel.kml --label "Smith 40"               # any parcel: Land id / Google Earth export
     python pipeline.py --regrid --apn 300006840 --path /us/ne/fillmore        # counties covered by your Regrid plan
+    python drone_photo.py DJI_0042.JPG --county adams-il --pin 20-0-0636-002-00 --golden   # real drone photo
+
+Live tool: https://ai-image-listing-tool-production.up.railway.app (shared login; see Hosting).
 
 Output: out/<PIN>/packet_<address>.zip (numbered images + README + scan.json) and out/<PIN>/run.json (every API call).
 
@@ -13,8 +18,8 @@ Output: out/<PIN>/packet_<address>.zip (numbered images + README + scan.json) an
 
 | # | Stage | What happens | Data / API | Output |
 |---|-------|--------------|------------|--------|
-| 1 | parcel | Look up the parcel polygon, acreage, situs, owner, use code | County ArcGIS REST layer (counties.json) or Regrid v2 | parcel.geojson |
-| 2 | scan | Surroundings scan: roads (name, side, adjacent?), named/unnamed streams (crosses parcel? distance), building footprints inside the parcel, FEMA flood zone touching the parcel, neighbor land uses by side, Google Places POIs, land-cover split from satellite pixels | County layers roads/streams/buildings/FIRM/parcels; Google Places Nearby; pixel stats | scan.json + one-paragraph scene description + do-not-invent list |
+| 1 | parcel | Look up the parcel polygon, acreage, situs, owner, use code | County or statewide ArcGIS REST parcel layer (counties.json), Regrid v2, or a boundary file (KML/KMZ/GeoJSON/zipped SHP); county/city/zip filled by Google Geocoding when the layer lacks them | parcel.geojson |
+| 2 | scan | Surroundings scan: roads (name, side, adjacent?, geometry), named/unnamed streams (crosses parcel? distance), ponds, building footprints inside the parcel, FEMA flood zone touching the parcel, neighbor land uses by side, Google Places POIs, OSM power lines, land-cover split from satellite pixels | `scan: county` → county layers; `scan: federal` → TIGERweb roads (layers 2/3/8, field NAME), NHD streams/waterbodies, USA Structures, FEMA NFHL, neighbors from the same parcel layer; Overpass; pixel stats | scan.json + one-paragraph scene description + do-not-invent list |
 | 3 | satellite | 640×480 @2× satellite reference, clean and with the magenta boundary drawn server-side (Static Maps `path=`) | Google Maps Static API | ref_clean.png, ref_fiducial.png |
 | 4 | phase1 | Annotated satellite set: cover 4:3, tight, wide, clean — outline, pin, acreage card, road labels, POI pins, disclaimer | Pillow compositor (listing_shot.py) | p1_*.png |
 | 5 | render | For each view: reference rotated so the camera side is at the bottom (uploaded), prompt = camera + lighting + scene facts + "keep the magenta boundary"; submit, poll, download | Higgsfield API, model `xai/grok-imagine-image-2.0` (1k, 4:3) | ai/<model>_<view>_<light>.jpg, ai/prompts.json |
@@ -64,6 +69,24 @@ Domains the workspace must be allowed to reach (claude.ai → Settings → Capab
 `d3u0tzju9qaucj.cloudfront.net` (render downloads), `fnf-api-input-prod-20250414194641741400000002.s3.amazonaws.com` (reference uploads),
 `www.adamscountyarcserver.com` (Adams County GIS). Add a county's GIS host when you add that county to counties.json.
 
+## Parcel sources (counties.json)
+
+| Key | Coverage | Parcel number | Scan | Notes |
+|---|---|---|---|---|
+| `adams-il` | Adams County, IL | PIN (digits compared, dashes ignored) | county layers | richest scan (county roads/streams/buildings/FIRM) |
+| `nc` | North Carolina statewide (NC OneMap) | `parno` as on the county site | federal | parcel numbers are not unique statewide in a few counties — first match wins |
+| `fl` | Florida statewide (FDACS parcels) | `PARCEL_ID` | federal | no situs field → Geocoding fills street/city/zip |
+| `va` | Virginia statewide (VGIN) | `PARCELID` (localities format these differently; spacing is normalized) | federal | county from `LOCALITY`; Geocoding fills the rest |
+| `regrid` | any US county on a paid Regrid plan | APN or street address | federal | trial token covers only 7 demo counties |
+| boundary file | anywhere | — | federal | Land id → export KML; Google Earth → KML/KMZ; shapefile as .zip. Largest polygon is used; acreage from geometry |
+
+Missouri: no free statewide parcel layer (counties publish their own, or none). Options: Regrid self-serve plan (nationwide, ~$0.05–0.10/lookup),
+or export the parcel from Land id as KML and use the boundary-file option. onX Hunt does not export parcel boundaries; Pixly adds nothing here.
+
+Federal layers (`_federal` in counties.json) — all free, no key: TIGERweb Transportation layers 2 (primary), 3 (US highways), 8 (local), field `NAME`;
+NHD MapServer 6 (flowlines) and 12 (waterbodies), field `gnis_name` — request only that field or the query times out; FEMA NFHL layer 28 (`FLD_ZONE`, `SFHA_TF`);
+USA Structures FeatureServer/0. All scan calls have a 25 s timeout and fail soft (the run continues with less context).
+
 ## Adding a county
 
 1. Find the county's public ArcGIS REST endpoint (search "<county> GIS arcgis rest services"; the county GIS page usually lists it).
@@ -72,6 +95,17 @@ Domains the workspace must be allowed to reach (claude.ai → Settings → Capab
 4. Add a block to counties.json (copy adams-il), map the fields, add use-code meanings if the county publishes them.
 5. Allow the host, then run `pipeline.py --county <key> --pin <PIN> --no-render` to check the parcel + scan before paying for renders.
 Counties on Regrid skip all of this (`--regrid`), but Regrid has no road/stream/building/flood layers — the scan is thinner.
+
+## Real drone photo (drone_photo.py / "Real drone photo" tab)
+
+Puts the true property line (and the acreage card, road labels, disclaimer) on a photo the drone actually took, with an optional golden-hour relight.
+1. Line placement: DJI photos straight from the SD card carry XMP tags (`drone-dji:GpsLatitude/GpsLongitude/RelativeAltitude/GimbalYawDegree/GimbalPitchDegree`)
+   plus EXIF focal length. The parcel polygon is projected through a flat-ground pinhole camera model (validated to ~1.5 px on a synthetic frame).
+   Photos that went through a phone, chat app, or editor lose those tags → the tool says which tags it found and falls back to **clicking the corners** in the UI
+   (clicks are taken on a 1600-px working copy so redraws are instant).
+2. Golden hour: the polygon is drawn as a thin magenta marker, Grok re-lights the photo keeping the marker, the marker is detected, erased and redrawn as the styled line.
+   Outputs: `<photo>_original_with_lines.jpg`, `<photo>_golden_with_lines.jpg`, `<photo>_golden_no_lines.jpg`.
+Camera: DJI Mini 2 (24 mm equiv, 4:3) is the reference; any DJI with the same tags works.
 
 ## Hosting (so the team runs it without anyone's laptop)
 
@@ -86,10 +120,17 @@ package it. Three ways to put it on the web, cheapest-viable first:
 
 Not recommended: Streamlit Cloud (public only), a desktop app (back on one machine), Zapier/Make (can't run the image math).
 
-Deploy steps (Railway): 1) put this folder in a private GitHub repo (no .env — keys go in Railway → Variables:
-REGRID_TOKEN, GOOGLE_MAPS_KEY, HIGGSFIELD_KEY, APP_PASSWORD). 2) Railway → New Project → Deploy from GitHub → it detects the
-Dockerfile. 3) Settings → Networking → Generate Domain. 4) Share URL + password with the team. Output zips live in the container's
-out/ folder (ephemeral): add a Railway volume at /app/out, or push packets to a Drive/Dropbox folder (next improvement).
+Current deployment: GitHub `iamawesome17/Ai-Image-listing-tool-` (private, branch `main`) → Railway project, auto-redeploys on every push
+(~4 min build). URL: https://ai-image-listing-tool-production.up.railway.app. Login: user `bana`, password = Railway variable `APP_PASSWORD`.
+Railway → Variables: REGRID_TOKEN, GOOGLE_MAPS_KEY, HIGGSFIELD_KEY, APP_PASSWORD. Railway has unrestricted egress, so everything that is
+blocked from the Claude workspace (reference uploads → diagonal angles, Overpass) works there.
+
+To update: edit files in `C:\Users\Hiwat\Documents\bana-listing-tool`, then `git add -A && git commit -m "..." && git push` (needs a GitHub
+token with `repo` scope on that repo). Watch the build in Railway → Deployments.
+
+Adding people: today one shared login. For per-person logins add a `USERS` variable (`alice:pw1,bob:pw2`) and change `auth=` in app.py to read it —
+Gradio accepts a list of (user, password) pairs. Output zips live in the container's out/ folder (ephemeral): add a Railway volume at /app/out,
+or push packets to a Drive/Dropbox folder (next improvement).
 
 ## Costs (list prices, Oct 2026)
 
@@ -107,7 +148,8 @@ out/ folder (ephemeral): add a Railway volume at /app/out, or push packets to a 
 - Road labels and POI pins are drawn on satellite images only (positions in AI renders are unknown).
 - Rural building footprints are not in the Adams County layer outside the Quincy tri-township; the scan says "0 buildings" there even when sheds exist.
 - A lot of under ~0.25 ac on soft (upscaled) satellite imagery gives the model little to hold onto — expect more invention.
-- Powerlines: no county layer; OpenStreetMap has them (allow `overpass-api.de`) — the pipeline already draws and labels them when data exists.
-  Until then, add known features by hand (next: a `--features` file for pond / driveway / electric poles callouts).
-- Diagonal angles (NE/SE/SW/NW) need the upload host `fnf-api-input-prod-…s3.amazonaws.com` allowed; the model-rotation trick only does 90°/180°.
+- Powerlines come from OpenStreetMap (Overpass, with mirrors) — coverage is patchy in rural areas, and the main server is often at capacity; the run continues without them.
+- Google Geocoding API must be in the key's API-restriction list, or FL/VA/boundary-file cards show no city/zip and road labels are skipped (REQUEST_DENIED in the log).
+- Diagonal angles (NE/SE/SW/NW) need the reference upload, which works on Railway but not from the Claude workspace; the model-rotation trick only does 90°/180°.
+- Drone-photo auto placement assumes flat ground; on steep sites, click the corners instead (drag-to-adjust is the next improvement).
 - Not yet done: orbit video (Kling/Seedance image-to-video on Higgsfield), listing-copy generation, push to Notion/Airtable deal record.
