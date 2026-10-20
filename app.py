@@ -21,13 +21,15 @@ PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 
 # ---------------- tab 1: generate from parcel ----------------
-def run(county_label, pin, lat, lon, angles, lights, render, progress=gr.Progress()):
+def run(county_label, pin, lat, lon, boundary, label, angles, lights, render, progress=gr.Progress()):
     county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
-    if not pin and not (lat and lon):
-        raise gr.Error("Enter a parcel number, or both a latitude and a longitude.")
+    if not boundary and not pin and not (lat and lon):
+        raise gr.Error("Enter a parcel number, both coordinates, or upload a boundary file.")
     cmd = [sys.executable, str(HERE / "pipeline.py"), "--county", county, "--angles", angles, "--lights", lights]
-    if COUNTIES[county].get("kind") == "regrid" and pin and ("," in pin or " " in pin.strip()):
+    if boundary:
+        cmd += ["--boundary", boundary] + (["--label", label] if label else [])
+    elif COUNTIES[county].get("kind") == "regrid" and pin and ("," in pin or " " in pin.strip()):
         cmd += ["--address", pin]                      # Regrid: a street address works best
     else:
         cmd += ["--pin", pin] if pin else ["--lat", str(lat), "--lon", str(lon)]
@@ -109,20 +111,33 @@ def photo_clear(path):
     return [], (_load(path) if path else None), "Corners cleared"
 
 
-def run_photo(path, work, county_label, pin, golden, pts, progress=gr.Progress()):
+def run_photo(path, work, county_label, pin, boundary, label, golden, pts, progress=gr.Progress()):
     import drone_photo as D, listing_shot as ls, pipeline as P
     county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
     if not path: raise gr.Error("Upload a drone photo first.")
-    if not pin: raise gr.Error("Enter the parcel number — it supplies the property line and the acreage card.")
+    if not pin and not boundary: raise gr.Error("Enter the parcel number or upload a boundary file — it supplies the property line and the acreage card.")
     progress(0.1, desc="Parcel lookup…")
-    cfg = COUNTIES[county]; parcel = P.fetch_parcel_county(cfg, pin)
+    cfg = COUNTIES[county]
+    if boundary:
+        import boundary_file
+        bpoly, _ = boundary_file.read_boundary(boundary)
+        parcel = ls.parcel_from_feature({"geometry": bpoly.__geo_interface__, "properties": {"PIN": Path(boundary).stem, "SiteAddress": label or ""}}, {})
+        c0 = bpoly.centroid; rg = P.reverse_geocode(c0.y, c0.x)
+        parcel["county"], parcel["city"], parcel["state"], parcel["zip"] = rg.get("county", ""), rg.get("city", ""), rg.get("state", ""), rg.get("zip", "")
+        parcel["situs"] = label or rg.get("street", ""); parcel["use_desc"] = "land"
+        cfg = {"name": "boundary file", "kind": "file", "scan": "federal", "fields": {}, "defaults": {}}
+    elif cfg.get("kind") == "regrid":
+        parcel = ls.fetch_parcel(pin, None, pin if ("," in pin or " " in pin) else None, None, None)
+    else:
+        parcel = P.fetch_parcel_county(cfg, pin)
     scan = None
     try:
         progress(0.25, desc="Surroundings scan…")
         poly = parcel["polygon"]; c = poly.centroid
         z = ls.choose_zoom(poly, 640, 480, margin=0.22); fr = ls.Frame(c.y, c.x, z, 640, 480)
-        scan = P.scan_surroundings(cfg, parcel, ls.fetch_satellite(fr), fr)
+        fed = json.loads((HERE / "counties.json").read_text())["_federal"]
+        scan = P.scan_surroundings(cfg, parcel, ls.fetch_satellite(fr), fr) if cfg.get("scan") == "county" else P.scan_federal(fed, cfg, parcel, ls.fetch_satellite(fr), fr)
     except Exception:
         scan = None
     points = [tuple(p) for p in pts] if pts and len(pts) >= 3 else None
@@ -170,6 +185,9 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                 gr.Markdown('<div class="help">Parcel number as shown on the county assessor site. …or locate by coordinates:</div>')
                 with gr.Row():
                     lat = gr.Number(label="Latitude", value=None); lon = gr.Number(label="Longitude", value=None)
+                with gr.Accordion("Or upload a boundary file (Land id / onX / Google Earth export)", open=False):
+                    boundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
+                    blabel = gr.Textbox(label="Address or name for the card", placeholder="7617 State St")
                 render = gr.Checkbox(value=True, label="Generate AI drone views (≈ $0.60, 1–2 min)")
                 with gr.Accordion("Advanced", open=False):
                     angles = gr.CheckboxGroup(["S", "E", "W", "N", "NE", "SE", "SW", "NW"], value=["S", "E", "W", "N"], label="Camera positions")
@@ -181,8 +199,8 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                 gallery = gr.Gallery(label="Packet", columns=3, height=640, object_fit="cover", show_label=False)
                 with gr.Accordion("Run log", open=False):
                     logbox = gr.Textbox(lines=14, show_label=False)
-        go.click(lambda c, p, la, lo, a, l, r: run(c, p, la, lo, ",".join(a) or "S", ",".join(l) or "golden", r),
-                 [county, pin, lat, lon, angles, lights, render], [gallery, zipf, summary, logbox])
+        go.click(lambda c, p, la, lo, b, bl, a, l, r: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", r),
+                 [county, pin, lat, lon, boundary, blabel, angles, lights, render], [gallery, zipf, summary, logbox])
 
     with gr.Tab("Real drone photo"):
         with gr.Row():
@@ -192,6 +210,9 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                 pstatus = gr.Markdown('<div class="help">Upload a photo straight from the drone to keep its GPS and gimbal data.</div>')
                 pcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County")
                 ppin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
+                with gr.Accordion("Or upload a boundary file (Land id export)", open=False):
+                    pboundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
+                    plabel = gr.Textbox(label="Address or name for the card")
                 pgolden = gr.Checkbox(value=True, label="Add a golden-hour version (≈ $0.05)")
                 pclear = gr.Button("Clear corners", size="sm")
                 pgo = gr.Button("Annotate photo", variant="primary", size="lg")
@@ -202,7 +223,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
         photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo])
         photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
         pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
-        pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pgolden, pts_state], [pgallery, pnote])
+        pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pboundary, plabel, pgolden, pts_state], [pgallery, pnote])
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=2)

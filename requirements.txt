@@ -3,3 +3,4 @@ shapely
 numpy
 opencv-python-headless
 gradio==6.30.0
+pyshp

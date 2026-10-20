@@ -87,6 +87,7 @@ def reverse_geocode(lat, lon):
                 if "administrative_area_level_2" in t and "county" not in out: out["county"] = c["long_name"].replace(" County", "")
                 if "postal_code" in t and "zip" not in out: out["zip"] = c["long_name"]
                 if "route" in t and "street" not in out: out["street"] = c["long_name"]
+                if "administrative_area_level_1" in t and "state" not in out: out["state"] = c["short_name"]
             if len(out) >= 3: break
         return out
     except Exception:
@@ -541,6 +542,7 @@ class PolyFrame:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--county"); ap.add_argument("--pin"); ap.add_argument("--lat", type=float); ap.add_argument("--lon", type=float)
+    ap.add_argument("--boundary", help="KML/KMZ/GeoJSON/zipped Shapefile of the parcel (e.g. Land id export)"); ap.add_argument("--label", help="address/name for the card")
     ap.add_argument("--regrid", action="store_true"); ap.add_argument("--apn"); ap.add_argument("--path"); ap.add_argument("--address")
     ap.add_argument("--angles", default="S,E,W,N"); ap.add_argument("--lights", default="golden,day")
     ap.add_argument("--model", default="grok"); ap.add_argument("--res", default="2k", choices=["1k", "2k"]); ap.add_argument("--no-render", action="store_true"); ap.add_argument("--force", action="store_true")
@@ -553,7 +555,17 @@ def main():
     print("1/7 parcel", flush=True)
     sources = json.loads((HERE / "counties.json").read_text()); fed = sources["_federal"]
     cfg = sources.get(a.county or "regrid")
-    if a.regrid or cfg is None or cfg.get("kind") == "regrid":
+    if a.boundary:
+        import boundary_file
+        bpoly, bprops = boundary_file.read_boundary(a.boundary)
+        parcel = ls.parcel_from_feature({"geometry": bpoly.__geo_interface__, "properties": {"PIN": Path(a.boundary).stem, "SiteAddress": a.label or ""}}, {})
+        c0 = bpoly.centroid; rg = reverse_geocode(c0.y, c0.x)
+        parcel["county"] = rg.get("county", ""); parcel["city"] = rg.get("city", ""); parcel["zip"] = rg.get("zip", "")
+        parcel["state"] = rg.get("state", "")
+        parcel["situs"] = a.label or rg.get("street", ""); parcel["use_desc"] = "land"
+        cfg = {"name": "boundary file", "kind": "file", "scan": "federal", "fields": {}, "defaults": {}}
+        log("parcel", "boundary file", file=a.boundary, acres=parcel["acres"])
+    elif a.regrid or cfg is None or cfg.get("kind") == "regrid":
         parcel = ls.fetch_parcel(a.pin or a.apn, a.path, a.address, a.lat, a.lon); cfg = sources["regrid"]
         c0 = parcel["polygon"].centroid; rg = reverse_geocode(c0.y, c0.x)
         parcel["county"] = parcel["county"] or rg.get("county", ""); parcel["city"] = parcel["city"] or rg.get("city", "")
@@ -562,7 +574,7 @@ def main():
     else:
         parcel = fetch_parcel_county(cfg, a.pin, a.lat, a.lon)
     poly = parcel["polygon"]; c = poly.centroid
-    out = Path(a.out or f"out/{parcel['apn']}"); out.mkdir(parents=True, exist_ok=True); (out / "ai").mkdir(exist_ok=True)
+    out = Path(a.out or f"out/{str(parcel['apn']).replace('/', '_').replace(' ', '_')}"); out.mkdir(parents=True, exist_ok=True); (out / "ai").mkdir(exist_ok=True)
     (out / "parcel.geojson").write_text(json.dumps(parcel.get("feature") or {"type": "Feature", "geometry": poly.__geo_interface__, "properties": parcel["raw"]}))
     print(f"    {parcel['apn']} | {parcel['situs']} {parcel['city']} {parcel['state']} | {parcel['acres']} ac | {parcel.get('use_desc', parcel['use'])}")
 
