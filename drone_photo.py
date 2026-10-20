@@ -113,46 +113,77 @@ def metadata_debug(path):
     return "; ".join(bits)
 
 
+def ground_map_from_clicks(poly, clicks, W, H):
+    """Ground map from corners the user clicked (in order around the boundary). The parcel polygon is simplified to the same
+    number of corners, matched by cyclic shift/direction, and a homography is fitted. Returns (PlaneMap or None, error)."""
+    import layout as L
+    n = len(clicks)
+    if n < 4: return None, "need 4+ corners"
+    ring = [(x, y) for x, y, *_ in poly.exterior.coords][:-1]
+    # simplify the polygon down to n vertices
+    eps = 1e-6; simp = ring
+    while len(simp) > n and eps < 1e-2:
+        simp = [(x, y) for x, y, *_ in poly.simplify(eps).exterior.coords][:-1]; eps *= 1.5
+    if len(simp) != n: return None, f"parcel has {len(simp)} corners, {n} clicked"
+    best = None
+    for rev in (False, True):
+        seq = simp[::-1] if rev else simp
+        for k in range(n):
+            cand = seq[k:] + seq[:k]
+            pm = L.PlaneMap.fit(cand, clicks, W, H)
+            if pm and (best is None or pm.error < best[0]): best = (pm.error, pm)
+    if best is None: return None, "fit failed"
+    pm = best[1]
+    return (pm if pm.error < 0.02 * W else None), f"{pm.error:.1f} px"
+
+
 def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref_url=None, meta_path=None):
+    """Annotate a real drone photo: writes an editable run folder (clean images + maps.json + layout.json) and draws the outputs
+    through pipeline.finalize, so the web editor can adjust everything afterwards."""
+    import layout as L
     img = ImageOps.exif_transpose(Image.open(photo_path)).convert("RGBA")
     meta = read_metadata(meta_path or photo_path)
-    source = "manual points"
+    source = "manual corners"
     if pts is None and meta:
         pts = project_polygon(meta, parcel["polygon"], img.width, img.height); source = "DJI metadata projection"
-    # work at listing size (graphics are tuned for ~1150–1600 px wide)
     if img.width > 1600:
         k = 1600 / img.width; img = img.resize((1600, round(img.height * k)), Image.LANCZOS)
         if pts: pts = [(x * k, y * k) for x, y in pts]
     if not pts:
         raise RuntimeError("No property line: the photo has no usable DJI metadata — click the corners in the UI.")
-    out_dir = Path(out_dir or f"out/{parcel['apn']}/photos"); out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(photo_path).stem
-    results = {"source": source, "meta": meta, "points": pts}
-    variants = [("original", img)]
+    stem = Path(photo_path).stem.replace("_work", "")
+    out_dir = Path(out_dir or f"out/{parcel['apn']}/photos") / stem; out_dir.mkdir(parents=True, exist_ok=True)
+    poly = parcel["polygon"]
+    # ground map: exact from metadata (pinhole + flat ground = homography), or fitted from the clicked corners
+    if source.startswith("DJI"):
+        ll = [(x, y) for x, y, *_ in poly.exterior.coords][:-1]
+        pm = L.PlaneMap.fit(ll, pts[:len(ll)], img.width, img.height); fit_note = "metadata"
+    else:
+        pm, fit_note = ground_map_from_clicks(poly, [tuple(p) for p in pts], img.width, img.height)
+    layout = L.build_layout(parcel, scan or {"roads": [], "water": [], "buildings": {}, "neighbors": []})
+    maps = {"_meta": {"model": "photo", "angles": [], "lights": [], "low": [], "photo": stem}}
+    img.convert("RGB").save(out_dir / "photo_original_clean.jpg", quality=94)
+    maps["photo_original"] = {"src": "photo_original_clean.jpg", "kind": "photo", "boundary_px": [list(p) for p in pts], "map": pm.to_json() if pm else None,
+                              "source": source, "fit": fit_note, "meta": meta}
     if golden:
         relit = relight_golden(img, pts, ref_url)
-        if relit.size != img.size:                              # model may return a different size: bring it back to ours
-            relit = relit.resize(img.size, Image.LANCZOS)
+        if relit.size != img.size: relit = relit.resize(img.size, Image.LANCZOS)
         det, q = P.detect_fiducial(relit)
         if det:
-            clean, _ = P.erase_markers(relit, q.get("_mask"), [], [])
-            relit_pts = det
-        else:                                                   # marker lost → trust the geometry, no erase needed
+            clean, _ = P.erase_markers(relit, q.get("_mask"), [], []); relit_pts = det
+            if pm:   # the relit image is the same frame: keep the same map; the marker only confirms the line survived
+                relit_pts = pts
+        else:
             clean, relit_pts = relit, pts
-        variants.append(("golden", (clean, relit_pts)))
-    labels = []
-    if scan and meta:                                   # camera sits opposite its heading: bearing of camera from the parcel
-        labels = P.geometric_labels(pts, scan.get("roads", []), (meta["yaw"] + 180) % 360)
-    files = []
-    for name, v in variants:
-        im, p = (v if isinstance(v, tuple) else (v, pts))
-        g = P.draw_graphics(im, p, parcel, labels)
-        f = out_dir / f"{stem}_{name}_with_lines.jpg"; g.convert("RGB").save(f, quality=94); files.append(str(f))
-        if name == "golden":
-            f2 = out_dir / f"{stem}_golden_no_lines.jpg"; im.convert("RGB").save(f2, quality=94); files.append(str(f2))
-    results["files"] = files
-    (out_dir / f"{stem}_annotate.json").write_text(json.dumps(results, indent=2, default=str))
-    return results
+        clean.convert("RGB").save(out_dir / "photo_golden_clean.jpg", quality=94)
+        maps["photo_golden"] = {"src": "photo_golden_clean.jpg", "kind": "photo", "boundary_px": [list(p) for p in relit_pts], "map": pm.to_json() if pm else None, "source": source}
+    (out_dir / "parcel.geojson").write_text(json.dumps({"type": "Feature", "geometry": poly.__geo_interface__, "properties": {}}))
+    (out_dir / "scan.json").write_text(json.dumps(scan or {}, indent=1, default=str))
+    (out_dir / "layout.json").write_text(json.dumps(layout, indent=1))
+    P.save_state(out_dir, parcel, maps)
+    zp, n = P.finalize(out_dir)
+    files = sorted(str(p) for p in out_dir.glob("photo_*_with_lines.jpg")) + ([str(out_dir / "photo_golden_clean.jpg")] if golden else [])
+    return {"source": source, "meta": meta, "points": pts, "files": files, "out_dir": str(out_dir), "zip": str(zp), "fit": fit_note, "ground_map": bool(pm)}
 
 
 if __name__ == "__main__":

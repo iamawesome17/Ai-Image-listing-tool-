@@ -18,15 +18,103 @@ sys.path.insert(0, str(HERE))
 COUNTIES = {k: v for k, v in json.loads((HERE / "counties.json").read_text()).items() if not k.startswith("_")}
 COUNTY_LABELS = {k: v.get("name", k) for k, v in COUNTIES.items()}
 PASSWORD = os.environ.get("APP_PASSWORD", "")
+EDITOR_JS = (HERE / "editor.js").read_text()
+
+VIEW_NAMES = {"nadir": "Overhead", "S": "From the south", "N": "From the north", "E": "From the east", "W": "From the west",
+              "NE": "From the north-east", "SE": "From the south-east", "SW": "From the south-west", "NW": "From the north-west"}
+
+
+def editable_images(out_dir):
+    """(label, key) pairs for the editor dropdown, flagship first."""
+    import pipeline as P
+    parcel, layout, maps, scan = P.load_state(out_dir)
+    items = []
+    for k, rec in maps.items():
+        if k.startswith("_"): continue
+        if rec["kind"] == "satellite": items.append((f"Satellite — {k.split('_')[1]}", k, 5))
+        elif rec["kind"] == "photo": items.append(("Drone photo — golden hour" if "golden" in k else "Drone photo — original", k, 0))
+        elif rec.get("map"):
+            v = VIEW_NAMES.get(rec["view"], rec["view"]); g = rec["light"] == "golden"
+            pri = (1 if rec["view"] == "nadir" else 2 if rec.get("low") else 3) if g else 4
+            items.append((f"{'Low view ' if rec.get('low') else ''}{v} — {rec['light']}", k, pri))
+    items.sort(key=lambda t: (t[2], t[0]))
+    return [(a, b) for a, b, _ in items]
+
+
+def packet_outputs(out_dir):
+    out_dir = Path(out_dir)
+    pk = sorted([p for p in out_dir.glob("packet_*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
+    zips = sorted(out_dir.glob("packet_*.zip"), key=lambda p: p.stat().st_mtime)
+    images = sorted(list(pk[-1].glob("*.jpg")) + list(pk[-1].glob("*.png"))) if pk else []
+    return [(str(p), p.stem.replace("_", " ")) for p in images], (str(zips[-1]) if zips else None)
+
+
+def list_runs():
+    """Previous runs (anything under out/ with a maps.json), newest first — lets you reopen a packet later."""
+    runs = []
+    for mp in (HERE / "out").rglob("maps.json"):
+        d = mp.parent
+        try:
+            pj = json.loads((d / "parcel.json").read_text()); name = f"{pj.get('situs') or pj.get('apn')} · {pj.get('city', '')}".strip(" ·")
+        except Exception:
+            name = d.name
+        kind = "photo" if (d / "photo_original_clean.jpg").exists() else "packet"
+        runs.append((mp.stat().st_mtime, f"{name}  ({kind}, {time.strftime('%b %d %H:%M', time.localtime(mp.stat().st_mtime))})", str(d)))
+    runs.sort(reverse=True)
+    return [(a, b) for _, a, b in runs[:40]]
+
+
+def pick_run(out_dir):
+    if not out_dir: return gr.update(), None
+    items = editable_images(out_dir)
+    return gr.update(choices=items, value=items[0][1] if items else None), out_dir
+
+
+def open_editor(out_dir):
+    if not out_dir: raise gr.Error("Run a packet first.")
+    items = editable_images(out_dir)
+    return gr.update(choices=items, value=items[0][1] if items else None), gr.Tabs(selected="edit")
+
+
+def editor_payload(out_dir, key):
+    import pipeline as P
+    if not out_dir or not key: return ""
+    pl = P.editor_payload(out_dir, key)
+    return json.dumps(pl) if pl else ""
+
+
+def apply_and_rebuild(out_dir, key, edits_json, progress=gr.Progress()):
+    import pipeline as P
+    if not out_dir or not key: raise gr.Error("Nothing to apply — open a run in the editor first.")
+    try:
+        edits = json.loads(edits_json) if edits_json else None
+    except Exception:
+        edits = None
+    if not edits: raise gr.Error("The editor has nothing loaded yet — pick an image and click Load.")
+    progress(0.2, desc="Applying edits to every image…")
+    zp, n = P.apply_edits(out_dir, key, edits)
+    imgs, z = packet_outputs(out_dir)
+    return imgs, z, f"**Packet rebuilt: {n} images.** Edits applied to every view (lines, pin card, callouts)."
+
+
+def reset_edits(out_dir):
+    import pipeline as P
+    if not out_dir: raise gr.Error("Nothing to reset.")
+    out = Path(out_dir); parcel, layout, maps, scan = P.load_state(out)
+    import listing_shot as ls
+    lay = P.L.build_layout(parcel, scan)
+    (out / "layout.json").write_text(json.dumps(lay, indent=1))
+    zp, n = P.finalize(out); imgs, z = packet_outputs(out)
+    return imgs, z, "**Edits reset** — labels and lines are back to the automatic placement."
 
 
 # ---------------- tab 1: generate from parcel ----------------
-def run(county_label, pin, lat, lon, boundary, label, angles, lights, render, progress=gr.Progress()):
+def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, render, progress=gr.Progress()):
     county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
     if not boundary and not pin and not (lat and lon):
         raise gr.Error("Enter a parcel number, both coordinates, or upload a boundary file.")
-    cmd = [sys.executable, str(HERE / "pipeline.py"), "--county", county, "--angles", angles, "--lights", lights]
+    cmd = [sys.executable, str(HERE / "pipeline.py"), "--county", county, "--angles", angles, "--lights", lights, "--low", low]
     if boundary:
         cmd += ["--boundary", boundary] + (["--label", label] if label else [])
     elif COUNTIES[county].get("kind") == "regrid" and pin and ("," in pin or " " in pin.strip()):
@@ -38,8 +126,8 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, render, pr
     t0 = time.time()
     proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     log, stage = [], 0.05
-    marks = {"2/7": (0.15, "Scanning surroundings…"), "4/7": (0.25, "Annotated satellite set…"), "5/7": (0.35, "Rendering drone views (1–2 min)…"),
-             "6/7": (0.85, "Placing property lines…"), "7/7": (0.95, "Packing zip…")}
+    marks = {"2/7": (0.15, "Scanning surroundings…"), "4/7": (0.25, "Layout + satellite set…"), "5/7": (0.35, "Rendering drone views (1–3 min)…"),
+             "6/7": (0.85, "Fitting property lines…"), "7/7": (0.95, "Drawing + plat + zip…")}
     for line in proc.stdout:
         log.append(line.rstrip())
         for k, (v, d) in marks.items():
@@ -54,12 +142,10 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, render, pr
             out_dir = Path(line.split("→")[1].strip().split(" ")[0]).parent
     if out_dir is None:
         out_dir = sorted((HERE / "out").glob("*"), key=lambda p: p.stat().st_mtime)[-1]
-    pk = sorted([p for p in out_dir.glob("packet_*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
-    zips = sorted(out_dir.glob("packet_*.zip"), key=lambda p: p.stat().st_mtime)
-    images = sorted(pk[-1].glob("*.jpg")) + sorted(pk[-1].glob("*.png")) if pk else sorted(out_dir.glob("p1_*.png"))
+    images, z = packet_outputs(out_dir)
     scan = json.loads((out_dir / "scan.json").read_text()).get("scene_description", "") if (out_dir / "scan.json").exists() else ""
-    summary = f"**{len(images)} images · {round(time.time()-t0)} s**\n\n{scan}"
-    return [(str(p), p.stem.replace("_", " ")) for p in images], (str(zips[-1]) if zips else None), summary, text[-4000:]
+    summary = f"**{len(images)} images · {round(time.time()-t0)} s** — review them, then use **Review & edit** to fix any label or line before you ship.\n\n{scan}"
+    return images, z, summary, text[-4000:], str(out_dir)
 
 
 # ---------------- tab 2: real drone photo ----------------
@@ -149,8 +235,9 @@ def run_photo(path, work, county_label, pin, boundary, label, golden, pts, progr
     note = f"Property line from **{r['source']}**."
     if r.get("meta"):
         m = r["meta"]; note += f" Camera: {m['model'] or 'drone'}, {m['alt_m']:.0f} m up, heading {m['yaw']:.0f}°, tilt {m['pitch']:.0f}°."
-    note += " Check the line against what you know of the property — metadata placement is approximate (a few metres)."
-    return [(f, Path(f).stem.replace("_", " ")) for f in r["files"]], note
+    note += (" Callouts placed from the ground fit." if r.get("ground_map") else " No ground fit (corners only) — boundary and card drawn, no callouts.")
+    note += " Check the line against what you know of the property, then use **Review & edit** to adjust."
+    return [(f, Path(f).stem.replace("_", " ")) for f in r["files"]], note, r["out_dir"], r.get("zip")
 
 
 # ---------------- UI ----------------
@@ -171,61 +258,127 @@ CSS = """
 .help {color:#5c5a55; font-size:13px; margin: -4px 0 6px;}
 footer {display:none !important;}
 .gallery-item img {object-fit: cover;}
+.bana-btn {background:#fff;border:1px solid #d9d6cf;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;color:#2b2a27;}
+.bana-btn:hover {background:#f1f0ec;}
+.bana-in {width:100%;box-sizing:border-box;border:1px solid #d9d6cf;border-radius:8px;padding:7px 9px;font-size:13px;background:#fff;color:#111;}
+"""
+
+EDITOR_HTML = """
+<div id="bana-editor" style="border:1px solid #e3e1dc;border-radius:12px;padding:10px;background:#fff">
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+    <button id="bana-add-callout" class="bana-btn">+ Callout</button>
+    <button id="bana-add-road" class="bana-btn">+ Road pin</button>
+    <button id="bana-corner" class="bana-btn">+ Corner</button>
+    <button id="bana-del" class="bana-btn">Delete selected</button>
+    <button id="bana-undo" class="bana-btn">Undo</button>
+    <span id="bana-status" style="color:#5c5a55;font-size:13px;margin-left:6px"></span>
+  </div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <div style="flex:1 1 640px;min-width:320px"><canvas id="bana-canvas" style="width:100%;border-radius:10px;background:#111;cursor:crosshair"></canvas></div>
+    <div style="flex:0 0 260px;display:flex;flex-direction:column;gap:10px">
+      <div style="background:#f6f5f1;border-radius:10px;padding:10px">
+        <div style="font-weight:600;font-size:13px;margin-bottom:6px">Acreage card</div>
+        <input id="bana-title" class="bana-in" placeholder="30.21 ACRES +/-">
+        <input id="bana-csub" class="bana-in" placeholder="ADDRESS · COUNTY" style="margin-top:6px">
+      </div>
+      <div id="bana-labelpanel" style="display:none;background:#f6f5f1;border-radius:10px;padding:10px">
+        <div style="font-weight:600;font-size:13px;margin-bottom:6px">Selected label</div>
+        <input id="bana-text" class="bana-in" placeholder="TEXT">
+        <input id="bana-sub" class="bana-in" placeholder="small second line (optional)" style="margin-top:6px">
+        <select id="bana-kind" class="bana-in" style="margin-top:6px"><option value="feature">Callout (black)</option><option value="road">Road pin (white)</option></select>
+      </div>
+      <div style="background:#f6f5f1;border-radius:10px;padding:10px">
+        <div style="font-weight:600;font-size:13px;margin-bottom:6px">Disclaimer line</div>
+        <input id="bana-disc" class="bana-in">
+      </div>
+    </div>
+  </div>
+</div>
 """
 
 with gr.Blocks(title="Bana Listing Photos") as demo:
     gr.HTML('<div id="hero"><h1>Bana Listing Photos</h1><p>Parcel number in → listing-ready images out: true property lines on satellite and AI drone views, or on your own drone photos.</p></div>')
 
-    with gr.Tab("Generate from parcel"):
-        with gr.Row():
-            with gr.Column(scale=1, min_width=320):
-                gr.Markdown("### Property")
-                county = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County")
-                pin = gr.Textbox(label="Parcel number (PIN / APN) — or a street address for the Regrid option", placeholder="20-0-0636-002-00")
-                gr.Markdown('<div class="help">Parcel number as shown on the county assessor site. …or locate by coordinates:</div>')
-                with gr.Row():
-                    lat = gr.Number(label="Latitude", value=None); lon = gr.Number(label="Longitude", value=None)
-                with gr.Accordion("Or upload a boundary file (Land id / onX / Google Earth export)", open=False):
-                    boundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
-                    blabel = gr.Textbox(label="Address or name for the card", placeholder="7617 State St")
-                render = gr.Checkbox(value=True, label="Generate AI drone views (≈ $0.60, 1–2 min)")
-                with gr.Accordion("Advanced", open=False):
-                    angles = gr.CheckboxGroup(["S", "E", "W", "N", "NE", "SE", "SW", "NW"], value=["S", "E", "W", "N"], label="Camera positions")
-                    lights = gr.CheckboxGroup(["golden", "day"], value=["golden", "day"], label="Lighting")
-                go = gr.Button("Create packet", variant="primary", size="lg")
-                summary = gr.Markdown()
-                zipf = gr.File(label="Download packet (zip)")
-            with gr.Column(scale=2):
-                gallery = gr.Gallery(label="Packet", columns=3, height=640, object_fit="cover", show_label=False)
-                with gr.Accordion("Run log", open=False):
-                    logbox = gr.Textbox(lines=14, show_label=False)
-        go.click(lambda c, p, la, lo, b, bl, a, l, r: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", r),
-                 [county, pin, lat, lon, boundary, blabel, angles, lights, render], [gallery, zipf, summary, logbox])
+    run_dir = gr.State(None)
+    LOAD_JS = "(p) => { if (p) window.banaEditor.load(JSON.parse(p)); }"
+    with gr.Tabs() as tabs:
+        with gr.Tab("Generate from parcel", id="gen"):
+            with gr.Row():
+                with gr.Column(scale=1, min_width=320):
+                    gr.Markdown("### Property")
+                    county = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state")
+                    pin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
+                    gr.Markdown('<div class="help">Parcel number as shown on the county assessor site. …or locate by coordinates:</div>')
+                    with gr.Row():
+                        lat = gr.Number(label="Latitude", value=None); lon = gr.Number(label="Longitude", value=None)
+                    with gr.Accordion("Or upload a boundary file (Land id / Google Earth export) — works anywhere", open=False):
+                        boundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
+                        blabel = gr.Textbox(label="Address or name for the card", placeholder="7617 State St")
+                    render = gr.Checkbox(value=True, label="Generate AI drone views (≈ $0.90, 2–3 min)")
+                    with gr.Accordion("Advanced", open=False):
+                        angles = gr.CheckboxGroup(["S", "E", "W", "N", "NE", "SE", "SW", "NW"], value=["S", "E", "W", "N"], label="High camera positions")
+                        lights = gr.CheckboxGroup(["golden", "day"], value=["golden", "day"], label="Lighting")
+                        lowv = gr.Dropdown(["auto (road side + opposite)", "none", "S", "N", "E", "W"], value="auto (road side + opposite)", label="Low horizon views")
+                    go = gr.Button("Create packet", variant="primary", size="lg")
+                    summary = gr.Markdown()
+                    zipf = gr.File(label="Download packet (zip)")
+                    edit_btn = gr.Button("Review & edit this packet →", size="sm")
+                with gr.Column(scale=2):
+                    gallery = gr.Gallery(label="Packet", columns=3, height=640, object_fit="cover", show_label=False)
+                    with gr.Accordion("Run log", open=False):
+                        logbox = gr.Textbox(lines=14, show_label=False)
+            go.click(lambda c, p, la, lo, b, bl, a, l, lw, r: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", lw.split(" ")[0], r),
+                     [county, pin, lat, lon, boundary, blabel, angles, lights, lowv, render], [gallery, zipf, summary, logbox, run_dir])
 
-    with gr.Tab("Real drone photo"):
-        with gr.Row():
-            with gr.Column(scale=1, min_width=320):
-                gr.Markdown("### Photo + property")
-                photo = gr.Image(type="filepath", label="Drone photo", height=360, sources=["upload"])
-                pstatus = gr.Markdown('<div class="help">Upload a photo straight from the drone to keep its GPS and gimbal data.</div>')
-                pcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County")
-                ppin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
-                with gr.Accordion("Or upload a boundary file (Land id export)", open=False):
-                    pboundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
-                    plabel = gr.Textbox(label="Address or name for the card")
-                pgolden = gr.Checkbox(value=True, label="Add a golden-hour version (≈ $0.05)")
-                pclear = gr.Button("Clear corners", size="sm")
-                pgo = gr.Button("Annotate photo", variant="primary", size="lg")
-                pnote = gr.Markdown()
-            with gr.Column(scale=2):
-                pgallery = gr.Gallery(label="Results", columns=2, height=640, object_fit="contain", show_label=False)
-        pts_state = gr.State([]); orig_state = gr.State(None); work_state = gr.State(None)
-        photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo])
-        photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
-        pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
-        pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pboundary, plabel, pgolden, pts_state], [pgallery, pnote])
+        with gr.Tab("Real drone photo", id="photo"):
+            with gr.Row():
+                with gr.Column(scale=1, min_width=320):
+                    gr.Markdown("### Photo + property")
+                    photo = gr.Image(type="filepath", label="Drone photo", height=360, sources=["upload"])
+                    pstatus = gr.Markdown('<div class="help">Upload a photo straight from the drone (SD card) to keep its GPS and gimbal data. Otherwise click the parcel corners in order — 4 or more corners also enables callouts.</div>')
+                    pcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state")
+                    ppin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
+                    with gr.Accordion("Or upload a boundary file (Land id export)", open=False):
+                        pboundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
+                        plabel = gr.Textbox(label="Address or name for the card")
+                    pgolden = gr.Checkbox(value=True, label="Add a golden-hour version (≈ $0.05)")
+                    pclear = gr.Button("Clear corners", size="sm")
+                    pgo = gr.Button("Annotate photo", variant="primary", size="lg")
+                    pnote = gr.Markdown()
+                    pzip = gr.File(label="Download (zip)")
+                    pedit_btn = gr.Button("Review & edit these photos →", size="sm")
+                with gr.Column(scale=2):
+                    pgallery = gr.Gallery(label="Results", columns=2, height=640, object_fit="contain", show_label=False)
+            pts_state = gr.State([]); orig_state = gr.State(None); work_state = gr.State(None)
+            photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo])
+            photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
+            pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
+            pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pboundary, plabel, pgolden, pts_state], [pgallery, pnote, run_dir, pzip])
+
+        with gr.Tab("Review & edit", id="edit"):
+            gr.Markdown('<div class="help">Edit the flagship image once — every other view is redrawn from the same edits. Drag corners, callouts or the acreage card; double-click a callout to rename it; <b>Delete</b> removes the selected item. Add corners, callouts (black) or road pins (white) with the buttons, then <b>Apply</b>.</div>')
+            with gr.Row():
+                eruns = gr.Dropdown(choices=list_runs(), label="Run (newest first)", scale=3)
+                erefresh = gr.Button("↻", scale=0, min_width=48)
+            with gr.Row():
+                ekey = gr.Dropdown(choices=[], label="Image to edit", scale=3)
+                eload = gr.Button("Load", scale=1); eapply = gr.Button("Apply edits & rebuild packet", variant="primary", scale=2); ereset = gr.Button("Reset to automatic", scale=1)
+            gr.HTML(EDITOR_HTML)
+            epayload = gr.Textbox(visible=False); eedits = gr.Textbox(visible=False)
+            esummary = gr.Markdown()
+            with gr.Row():
+                egallery = gr.Gallery(label="Rebuilt packet", columns=4, height=420, object_fit="cover", show_label=False, scale=3)
+                ezip = gr.File(label="Download packet (zip)", scale=1)
+            eload.click(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+            ekey.change(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+            eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js="(o, k, e) => [o, k, JSON.stringify(window.banaEditor.export())]")
+            ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
+            erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
+            eruns.change(pick_run, [eruns], [ekey, run_dir])
+        edit_btn.click(open_editor, [run_dir], [ekey, tabs])
+        pedit_btn.click(open_editor, [run_dir], [ekey, tabs])
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=2)
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)), theme=THEME, css=CSS,
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)), theme=THEME, css=CSS, head=f"<script>{EDITOR_JS}</script>",
                 auth=(("bana", PASSWORD) if PASSWORD else None))

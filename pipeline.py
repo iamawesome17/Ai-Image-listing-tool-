@@ -32,6 +32,7 @@ from shapely.ops import unary_union
 sys.path.insert(0, str(Path(__file__).parent))
 import listing_shot as ls
 import drone_render as dr
+import layout as L
 
 HERE = Path(__file__).parent
 LOG = []                      # every external call, written to run.json
@@ -196,13 +197,15 @@ def scan_surroundings(cfg, parcel, sat_wide, frame_wide):
             crosses = g.intersects(poly)
             d = 0 if crosses else round(min(meters(Point(p), c) for p in (g.coords if isinstance(g, LineString) else [q for l in g.geoms for q in l.coords])))
             if crosses or d < 400:
-                scan["water"].append({"name": name.title() or "unnamed drainage", "crosses_parcel": crosses, "distance_m": d, "side": bearing(c, g.centroid)})
+                scan["water"].append({"name": name.title() or "unnamed drainage", "type": "stream", "crosses_parcel": crosses, "distance_m": d, "side": bearing(c, g.centroid),
+                                      **label_point(g, poly)})
     seen = set(); scan["water"] = [w for w in scan["water"] if not (w["name"] in seen or seen.add(w["name"]))]
 
     # buildings (footprint layer may not cover rural areas)
     bl = county_query(cfg, "buildings", envq, "scan").get("features", [])
     inside = [f for f in bl if shape(f["geometry"]).intersects(poly)]
-    scan["buildings"] = {"layer_features_nearby": len(bl), "inside_parcel": len(inside), "coverage_note": "footprint layer covers Quincy tri-township only; 0 may mean no coverage"}
+    scan["buildings"] = {"layer_features_nearby": len(bl), "inside_parcel": len(inside), "coverage_note": "footprint layer covers Quincy tri-township only; 0 may mean no coverage",
+                         "inside_points": building_points(inside, poly)}
 
     # flood
     fz = []
@@ -219,7 +222,8 @@ def scan_surroundings(cfg, parcel, sat_wide, frame_wide):
         g = unary_union([Polygon([(x, y) for x, y, *_ in ring]) for ring in f["geometry"]["rings"] if len(ring) >= 4])
         if g.distance(poly) * 111320 < 60:
             u = str(at.get(F["use"]) or "")
-            scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, f"code {u}"), "acres": at.get(F["acres"])})
+            scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, f"code {u}"), "acres": at.get(F["acres"]),
+                                      "pin": str(at.get(cfg["pin_field"]) or ""), "geometry": neighbor_geom(g)})
 
     # POIs + land cover
     try:
@@ -227,7 +231,7 @@ def scan_surroundings(cfg, parcel, sat_wide, frame_wide):
     except Exception as e:
         log("scan", "Places failed", err=str(e))
     scan["landcover"] = landcover_stats(sat_wide, frame_wide, poly)
-    scan["powerlines"] = osm_powerlines(poly)
+    osm_features(scan, poly)
     return scan
 
 
@@ -273,44 +277,89 @@ def scan_federal(fed, cfg, parcel, sat_wide, frame_wide):
     # buildings
     d = safe(lambda: layer_query(fed["buildings"]["url"], {**envq, "outFields": "OBJECTID"}, "scan", timeout=25), "USA Structures")
     bl = d.get("features", []); inside = [f for f in bl if shape(f["geometry"]).intersects(poly)]
-    scan["buildings"] = {"layer_features_nearby": len(bl), "inside_parcel": len(inside), "coverage_note": "USA Structures (nationwide footprints)"}
+    scan["buildings"] = {"layer_features_nearby": len(bl), "inside_parcel": len(inside), "coverage_note": "USA Structures (nationwide footprints)",
+                         "inside_points": building_points(inside, poly)}
     # flood
     d = safe(lambda: layer_query(fed["flood"]["url"], {**envq, "outFields": f"{fed['flood']['zone']},{fed['flood']['sfha']}"}, "scan", timeout=25), "FEMA NFHL")
     fz = [{"zone": f["properties"].get(fed["flood"]["zone"]), "sfha": f["properties"].get(fed["flood"]["sfha"])} for f in d.get("features", []) if shape(f["geometry"]).intersects(poly)]
     scan["flood"] = {"zones_touching_parcel": fz}
     # neighbors from the same parcel layer
-    if cfg.get("parcels_url") and "use" in cfg["fields"]:
-        d = safe(lambda: layer_query(cfg["parcels_url"], {**envq, "outFields": f"{cfg['pin_field']},{cfg['fields']['use']}", "resultRecordCount": 60}, "scan", timeout=25), "neighbors")
+    if cfg.get("parcels_url"):
+        usef = cfg["fields"].get("use")
+        d = safe(lambda: layer_query(cfg["parcels_url"], {**envq, "outFields": cfg["pin_field"] + (f",{usef}" if usef else ""), "resultRecordCount": 60}, "scan", timeout=25), "neighbors")
         for f in d.get("features", []):
             if str(f["properties"].get(cfg["pin_field"])) == str(parcel["apn"]): continue
             g = shape(f["geometry"])
             if not g.is_empty and g.distance(poly) * 111320 < 60:
-                u = str(f["properties"].get(cfg["fields"]["use"]) or "").strip()
-                if not u: continue                                   # no use recorded → nothing useful to say
-                scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, u.lower() if not u.isdigit() else f"use code {u}")})
+                u = str(f["properties"].get(usef) or "").strip() if usef else ""
+                scan["neighbors"].append({"side": bearing(c, g.centroid), "use": cfg.get("use_codes", {}).get(u, u.lower() if not u.isdigit() else f"use code {u}"),
+                                          "pin": str(f["properties"].get(cfg["pin_field"]) or ""), "geometry": neighbor_geom(g)})
     try:
         scan["pois"] = ls.nearby_pois(c.y, c.x, radius_m=2500)[:5]; log("scan", "Google Places nearby", n=len(scan["pois"]))
     except Exception as e:
         log("scan", "Places failed", err=str(e))
     scan["landcover"] = landcover_stats(sat_wide, frame_wide, poly)
-    scan["powerlines"] = osm_powerlines(poly)
+    osm_features(scan, poly)
     return scan
 
 
-def osm_powerlines(poly, pad=0.004):
-    """OpenStreetMap power lines near the parcel (Overpass). Returns [] when unreachable or none mapped."""
+def label_point(g, poly, max_m=60):
+    """Where to put a callout for geometry g relative to the parcel: inside the parcel if it crosses, else the nearest point (within max_m)."""
+    try:
+        if g.intersects(poly):
+            inter = g.intersection(poly); p = inter.representative_point() if not inter.is_empty else g.representative_point()
+            return {"label_lon": p.x, "label_lat": p.y}
+        p = g.interpolate(g.project(poly.centroid)) if hasattr(g, "project") else g.representative_point()
+        if p.distance(poly) * 111320 <= max_m:
+            return {"label_lon": p.x, "label_lat": p.y}
+    except Exception:
+        pass
+    return {}
+
+
+def neighbor_geom(g, tol=0.000005):
+    """Outer rings of a neighbor parcel, simplified, for the plat."""
+    polys = [g] if g.geom_type == "Polygon" else list(getattr(g, "geoms", []))
+    return [[[round(x, 6), round(y, 6)] for x, y, *_ in p.simplify(tol).exterior.coords] for p in polys if p.geom_type == "Polygon"]
+
+
+def building_points(features, poly):
+    pts = []
+    for f in features:
+        try:
+            g = shape(f["geometry"]).intersection(poly)
+            if not g.is_empty: p = g.representative_point(); pts.append([p.x, p.y, round(shape(f["geometry"]).area * 111320 * 110540)])
+        except Exception:
+            pass
+    return sorted(pts, key=lambda p: -p[2])            # biggest footprint first
+
+
+def osm_features(scan, poly, pad=0.004):
+    """OpenStreetMap power lines and driveways/tracks around the parcel (Overpass, with mirrors). Fails soft."""
     minx, miny, maxx, maxy = poly.bounds
-    q = f'[out:json][timeout:15];way["power"~"line|minor_line"]({miny-pad},{minx-pad},{maxy+pad},{maxx+pad});out geom;'
+    bb = f"({miny-pad},{minx-pad},{maxy+pad},{maxx+pad})"
+    q = f'[out:json][timeout:15];(way["power"~"line|minor_line"]{bb};way["highway"~"service|track|driveway"]{bb};);out geom;'
     body = urllib.parse.urlencode({"data": q}).encode()
+    scan["powerlines"], scan["powerline_points"], scan["driveways"], scan["driveway_points"] = [], [], [], []
     errs = []
     for host in OVERPASS_HOSTS:                                   # the main server is often at capacity (502) → try mirrors
         try:
             d = ls.http_json(f"https://{host}/api/interpreter", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=20)
-            lines = [[[n["lon"], n["lat"]] for n in w.get("geometry", [])] for w in d.get("elements", [])]
-            log("scan", "OSM power lines", host=host, n=len(lines)); return [l for l in lines if len(l) >= 2]
+            for w in d.get("elements", []):
+                line = [[n["lon"], n["lat"]] for n in w.get("geometry", [])]
+                if len(line) < 2: continue
+                tags = w.get("tags", {}); g = LineString(line)
+                if "power" in tags:
+                    scan["powerlines"].append(line); lp = label_point(g, poly, 40)
+                    if lp: scan["powerline_points"].append([lp["label_lon"], lp["label_lat"]])
+                else:
+                    if g.intersects(poly) or g.distance(poly) * 111320 < 15:
+                        scan["driveways"].append(line); lp = label_point(g, poly, 15)
+                        if lp: scan["driveway_points"].append([lp["label_lon"], lp["label_lat"]])
+            log("scan", "OSM features", host=host, power=len(scan["powerlines"]), driveways=len(scan["driveways"])); return
         except Exception as e:
             errs.append(f"{host}: {str(e)[:40]}")
-    log("scan", "OSM power lines unavailable", err="; ".join(errs)[:160]); return []
+    log("scan", "OSM features unavailable", err="; ".join(errs)[:160])
 
 
 OVERPASS_HOSTS = ["overpass-api.de", "overpass.private.coffee", "overpass.kumi.systems"]
@@ -342,8 +391,11 @@ def scene_description(parcel, scan):
     parts.append(("a creek (" + ", ".join(x["name"] for x in w) + ") crosses the parcel") if w else "no ponds, lakes or creeks on the parcel")
     b = scan.get("buildings", {}).get("inside_parcel", 0)
     parts.append(f"{b} small outbuilding{'s' if b != 1 else ''} on the parcel" if b else "no buildings on the parcel")
+    if scan.get("driveways"): parts.append("a gravel driveway enters the parcel")
+    if scan.get("powerlines"): parts.append("an overhead electric line on wooden poles runs past the parcel")
     nb = {}
     for n in scan["neighbors"]: nb.setdefault(n["use"], set()).add(n["side"])
+    nb.pop("", None)
     if nb: parts.append("neighbors: " + "; ".join(f"{u} to the {'/'.join(sorted(s))}" for u, s in nb.items()))
     desc = ". ".join(parts) + "."
     forbid = ["no water bodies unless listed above", "no buildings beyond those listed above, no new roads or driveways", "no vehicles, people, animals or signs",
@@ -425,7 +477,7 @@ def rotated_reference(frame_sq, poly, angle_deg, roads=None, power=None):
 
 # ---------- 5. prompts ----------
 def prompt_for(view, light, desc, forbid, roads=None, power=None):
-    close = view.endswith("_close"); view = view[:-6] if close else view
+    close = view.endswith("_close"); low = view.endswith("_low"); view = view.split("_")[0]
     lightw = {"day": "bright midday sunlight, clear blue sky, natural colors",
               "golden": "golden hour, low warm sunset light from the west, long soft shadows, warm sky at the horizon"}[light]
     scene = f"Scene facts (keep them true): {desc} " + "; ".join(forbid) + "."
@@ -437,6 +489,12 @@ def prompt_for(view, light, desc, forbid, roads=None, power=None):
             "do not add, move or remove anything. Photorealistic, sharp, 24mm lens.")
     if view == "nadir":
         cam = f"Turn this satellite image into a crisp professional drone photograph taken straight down from {'250' if close else '400'} ft, same framing and scale."
+    elif low:
+        cam = ("Turn this satellite image into a photograph taken from a drone hovering at TREETOP HEIGHT, about 40 ft above the ground, just beyond the BOTTOM edge "
+               f"of this image (the {dr.view_name(view)} side of the property), camera nearly level, tilted only 8 degrees below the horizon, looking across the land "
+               "toward the top of the image. This is a near-ground view: the horizon is about one third from the top of the frame with a wide sky above it, nearby "
+               "trees and grass are large in the foreground, the far side of the property is small and distant, strong perspective compression. "
+               "The magenta boundary stays fully inside the frame.")
     else:
         cam = ("Turn this satellite image into a realistic drone photograph. The drone hovers just beyond the BOTTOM edge of this image "
                f"at about 300 ft (that is the {dr.view_name(view)} side of the property), camera tilted 35 degrees down, looking toward the "
@@ -462,8 +520,11 @@ def detect_fiducial(img):
         return None, {"reason": "no magenta found"}
     c = max(cnts, key=cv2.contourArea)
     area = cv2.contourArea(c); hull = cv2.convexHull(c)
-    if area < 0.01 * img.width * img.height:
+    if area < 0.02 * img.width * img.height:
         return None, {"reason": f"magenta region too small ({int(area)} px)"}
+    bx, by, bw, bh = cv2.boundingRect(c)
+    if bw < 0.22 * img.width or bh < 0.12 * img.height:
+        return None, {"reason": f"magenta region too narrow ({bw}x{bh} px)"}
     approx = cv2.approxPolyDP(c, 0.01 * cv2.arcLength(c, True), True).reshape(-1, 2)
     if len(approx) < 3:
         return None, {"reason": "degenerate polygon"}
@@ -536,6 +597,21 @@ def draw_graphics(img, pts, parcel, labels=()):
     return out
 
 
+def render_qa(img, pts, scan):
+    """Catch renders where the model replaced the parcel's land cover (e.g. woods → open pasture). Returns None when fine, else a reason."""
+    lc = scan.get("landcover") or {}
+    if not lc or not pts: return None
+    mask = Image.new("L", img.size, 0); ImageDraw.Draw(mask).polygon(pts, fill=255); m = np.array(mask) > 0
+    if m.sum() < 500: return None
+    hsv = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2HSV)
+    h, s, v = (hsv[..., i].astype(int) for i in range(3))
+    grass = ((h > 25) & (h < 95) & (s > 60) & (v > 135) & m).sum() / m.sum()
+    dark = ((v < 110) & m).sum() / m.sum()
+    if lc.get("tree_canopy", 0) >= 0.7 and grass >= 0.5: return f"wooded parcel rendered as open ground ({int(grass*100)}% grass)"
+    if lc.get("open_green", 0) + lc.get("bare_or_crop_stubble", 0) >= 0.7 and dark >= 0.6: return f"open parcel rendered as woods ({int(dark*100)}% dark)"
+    return None
+
+
 def crop_to_parcel(img, pts, margin, out_size=(1152, 864)):
     """Crop around the parcel polygon (bbox + margin), keep 4:3, resize. Returns (image, fn mapping old px → new px)."""
     xs, ys = zip(*pts); x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
@@ -573,11 +649,15 @@ def main():
     ap.add_argument("--boundary", help="KML/KMZ/GeoJSON/zipped Shapefile of the parcel (e.g. Land id export)"); ap.add_argument("--label", help="address/name for the card")
     ap.add_argument("--regrid", action="store_true"); ap.add_argument("--apn"); ap.add_argument("--path"); ap.add_argument("--address")
     ap.add_argument("--angles", default="S,E,W,N"); ap.add_argument("--lights", default="golden,day")
+    ap.add_argument("--low", default="auto", help="low horizon views: 'auto' = road side + opposite, 'none', or e.g. S,N")
     ap.add_argument("--model", default="grok"); ap.add_argument("--res", default="2k", choices=["1k", "2k"]); ap.add_argument("--no-render", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--out"); ap.add_argument("--env", default=str(HERE / ".env"))
+    ap.add_argument("--finalize", help="re-draw every image from out/<PIN>/layout.json (after edits) and rebuild the packet; no API calls")
     a = ap.parse_args()
     ls.load_env(a.env)
     t0 = time.time()
+    if a.finalize:
+        zp, n = finalize(Path(a.finalize)); print(f"done in {round(time.time()-t0)}s → {zp}  ({n} images)"); return
 
     # 1 parcel
     print("1/7 parcel", flush=True)
@@ -620,6 +700,7 @@ def main():
     else:
         scan = scan_federal(fed, cfg, parcel, ref, frame)
     desc, forbid = scene_description(parcel, scan)
+    import plat; scan["plss"] = plat.plss_lookup(c.x, c.y); log("scan", "PLSS", **({"str": scan["plss"].get("text")} if scan["plss"] else {"note": "unavailable"}))
     if not parcel.get("acres"): parcel["acres"] = round(ls.acres_from_polygon(poly), 2)
     scan["scene_description"] = desc; scan["forbid"] = forbid
     (out / "scan.json").write_text(json.dumps(scan, indent=2, default=str))
@@ -630,27 +711,36 @@ def main():
     fid = Image.open(io.BytesIO(ls.http_bytes(fid_url))).convert("RGBA"); fid.convert("RGB").save(out / "ref_fiducial.png")
     log("satellite", "Static Maps fiducial (boundary + roads)", roads=[r["name"] for r in fid_roads])
 
-    # 4 phase 1 (annotated satellite)
-    print("4/7 phase-1 satellite set", flush=True)
-    roads = [{"name": r["name"].upper(), "lon": r["label_lon"], "lat": r["label_lat"]} for r in scan["roads"] if "label_lon" in r][:3]
-    pois = scan.get("pois", [])[:3]
+    # 4 layout + phase 1 (annotated satellite)
+    print("4/7 layout + satellite set", flush=True)
+    ref_map = L.FrameMap(frame)
+    layout = L.build_layout(parcel, scan, ref_map, ref)
+    (out / "layout.json").write_text(json.dumps(layout, indent=1))
+    log("layout", "features", labels=[l["text"] for l in layout["labels"]])
+    maps = {"_meta": {"model": a.model, "angles": [], "lights": [], "low": []}}
     zt = ls.choose_zoom(poly); zc = ls.choose_zoom(poly, 640, 480)
     frames = {"cover": ls.Frame(c.y, c.x, zc, 640, 480), "tight": ls.Frame(c.y, c.x, zt), "wide": ls.Frame(c.y, c.x, zt - 1)}
     for k, fr in frames.items():
         sat = ls.fetch_satellite(fr); log("satellite", f"Static Maps {k}", zoom=fr.z)
-        ls.compose(sat, fr, parcel, roads, pois).convert("RGB").save(out / f"p1_{k}.png")
-        if k == "cover": sat.convert("RGB").save(out / "p1_clean_cover.png")
+        sat.convert("RGB").save(out / f"p1_{k}_clean.png")
+        maps[f"p1_{k}"] = {"src": f"p1_{k}_clean.png", "map": L.FrameMap(fr).to_json(), "kind": "satellite", "pois": k == "wide"}
+    save_state(out, parcel, maps)
     if a.no_render:
-        (out / "run.json").write_text(json.dumps(LOG, indent=2)); print("done (phase 1 only)"); return
+        zp, n = finalize(out); (out / "run.json").write_text(json.dumps(LOG, indent=2)); print(f"done (phase 1 only) → {zp}  ({n} images)"); return
 
     # 5 render
     print("5/7 AI renders", flush=True)
-    angles = [(v.strip()[:-6].upper() + "_close") if v.strip().lower().endswith("_close") else v.strip().upper() for v in a.angles.split(",") if v.strip()]
+    angles = [v.strip().upper() for v in a.angles.split(",") if v.strip()]
+    lights = [l.strip() for l in a.lights.split(",") if l.strip()]
+    if a.low == "auto":
+        adj = [r for r in scan["roads"] if r.get("distance_m", 999) < 60]
+        side = {"NE": "E", "SE": "S", "SW": "W", "NW": "N"}.get(adj[0]["side"], adj[0]["side"]) if adj else "S"
+        low = [side, {"N": "S", "S": "N", "E": "W", "W": "E"}[side]]
+    else:
+        low = [] if a.low == "none" else [v.strip().upper() for v in a.low.split(",") if v.strip()]
+    maps["_meta"].update({"angles": angles, "lights": lights, "low": low})
     zs = ls.choose_zoom(poly, 480, 480, margin=0.20); frame_sq = ls.Frame(c.y, c.x, zs, 640, 640)
     ref_urls = {}
-    zc_close = ls.choose_zoom(poly, 640, 480, margin=0.12); frame_close = ls.Frame(c.y, c.x, zc_close, 640, 480)
-    fid_url_close = fiducial_static_url(frame_close, poly)
-    zs_close = ls.choose_zoom(poly, 480, 480, margin=0.10); frame_sq_close = ls.Frame(c.y, c.x, zs_close, 640, 640)
     rot_cache_f = out / "ref_rot_urls.json"
     rot_cache = json.loads(rot_cache_f.read_text()) if rot_cache_f.exists() and not a.force else {}
     def rotated_ref_url(base):
@@ -676,22 +766,18 @@ def main():
         rot_cache[base] = u; rot_cache_f.write_text(json.dumps(rot_cache)); return u
 
     def ref_for(view):
-        """Reference URL for a view. North-up reference = camera on the south side (also used for nadir);
-        E / W / N use a rotated copy of the square reference."""
-        base = view[:-6] if view.endswith("_close") else view
-        if base in ("nadir", "S"):
-            return fid_url
-        if base not in ref_urls:
-            ref_urls[base] = rotated_ref_url(base)
+        """Reference URL for a view. North-up reference = camera on the south side (also used for nadir); E / W / N use a rotated copy."""
+        base = view.split("_")[0]
+        if base in ("nadir", "S"): return fid_url
+        if base not in ref_urls: ref_urls[base] = rotated_ref_url(base)
         return ref_urls[base]
-    lights = [l.strip() for l in a.lights.split(",") if l.strip()]
     plan = [("nadir", l) for l in lights]
     for v in angles:
-        base = v[:-6] if v.endswith("_close") else v
         for l in lights:
-            if v.endswith("_close"): continue                                   # close-ups are crops of the same render
-            if l == "day" and base in ("NE", "SE", "SW", "NW"): continue       # diagonals golden-only
+            if l == "day" and v in ("NE", "SE", "SW", "NW"): continue       # diagonals golden-only
             plan.append((v, l))
+    for v in low:
+        for l in lights: plan.append((f"{v}_low", l))
     dr.MODELS[a.model]["extra"]["resolution"] = a.res
     jobs, prompts = {}, {}
     for v, l in plan:
@@ -706,10 +792,11 @@ def main():
         for key, st in (dr.hf_wait_all(jobs) if jobs else {}).items():
             if st.get("status") == "completed":
                 img = dr.download(st["images"][0]["url"])
-                if dr_has_marker(img):
+                pts_, _ = detect_fiducial(img); why = render_qa(img, pts_, scan) if pts_ else "no boundary marker in render"
+                if not why:
                     img.convert("RGB").save(out / "ai" / f"{key}.jpg", quality=95); log("render", "downloaded", key=key)
                 else:
-                    log("render", "no boundary marker in render", key=key); bad.append(key)
+                    log("render", "rejected: " + why, key=key); bad.append(key)
             else:
                 log("render", "FAILED", key=key, status=st.get("status"), error=st.get("error")); bad.append(key)
         return bad
@@ -722,64 +809,206 @@ def main():
         still = collect(retry)
         for k in still: log("render", "gave up", key=k)
 
-    # 6 outline on every render
-    print("6/7 outline detection", flush=True)
-    report = {}
+    # 6 marker → ground map on every render
+    print("6/7 outline detection + ground fit", flush=True)
     for p in sorted((out / "ai").glob(f"{a.model}_*.jpg")):
-        if p.stem.endswith("_outline"): continue
+        if p.stem.endswith("_clean") or p.stem.endswith("_outline"): continue
         img = Image.open(p).convert("RGBA")
         pts, q = detect_fiducial(img)
-        rec = {"fiducial": q}
+        parts = p.stem.split("_"); view, light = parts[1], parts[-1]; is_low = "low" in parts
+        rec = {"src": f"ai/{p.stem}_clean.jpg", "kind": "render", "view": view, "light": light, "low": is_low, "fiducial": {k: v for k, v in q.items() if k != "_mask"}}
         if pts:
-            clean, labels = erase_markers(img, q.pop("_mask", None), [], power)
-            view = p.stem.split("_")[1]
-            cam = COMPASS.get(view, 180)
-            labels += geometric_labels(pts, scan["roads"], cam) if view != "nadir" else geometric_labels(pts, scan["roads"], 180)
-            for suffix, margin in (("", 0.40 if view != "nadir" else 0.25), ("_close", 0.10)):
-                crop, T = crop_to_parcel(clean, pts, margin)
-                g = draw_graphics(crop, [T(x, y) for x, y in pts], parcel, [(T(x, y), t) for (x, y), t in labels])
-                g.convert("RGB").save(out / "ai" / f"{p.stem}{suffix}_outline.jpg", quality=94)
-            rec["outline"] = f"{p.stem}_outline.jpg"; rec["close"] = f"{p.stem}_close_outline.jpg"; rec["labels"] = [t for _, t in labels]
-        q.pop("_mask", None); report[p.stem] = rec
-        print(f"    {p.stem}: {'outline' if pts else 'NO outline'} {q}")
-    (out / "ai" / "outline_report.json").write_text(json.dumps(report, indent=2))
+            clean, _ = erase_markers(img, q.pop("_mask", None), [], [])
+            clean.convert("RGB").save(out / "ai" / f"{p.stem}_clean.jpg", quality=95)
+            init = L.FrameMap(frame) if view in ("S", "nadir") else L.RotMap(frame_sq, COMPASS.get(view, 180) - 180)
+            pm, err, bpx = L.fit_render_map(init, poly, pts, img.width, img.height, mask=q.get("_mask"))
+            rec.update({"map": pm.to_json() if pm else None, "boundary_px": bpx, "fit_err_px": round(err, 1)})
+            maps[p.stem] = rec
+            print(f"    {p.stem}: marker ok, ground fit {'OK' if pm else 'weak'} ({err:.0f} px)")
+        else:
+            print(f"    {p.stem}: NO marker {rec['fiducial']}")
+    save_state(out, parcel, maps)
 
-    # 7 packet
-    print("7/7 packet", flush=True)
-    name = f"packet_{(parcel['situs'] or parcel['apn']).replace(' ', '_')}_{parcel['city']}".replace("__", "_")
+    # 7 draw + packet
+    print("7/7 draw + packet", flush=True)
+    zp, n = finalize(out)
+    (out / "run.json").write_text(json.dumps({"parcel": {k: v for k, v in parcel.items() if k not in ("polygon", "raw", "feature")}, "plan": plan, "seconds": round(time.time() - t0), "calls": LOG}, indent=2))
+    print(f"done in {round(time.time()-t0)}s → {zp}  ({n} images)")
+
+
+# ---------- state + finalize (re-drawable from layout.json) ----------
+def save_state(out, parcel, maps):
+    (out / "maps.json").write_text(json.dumps(maps, indent=1))
+    (out / "parcel.json").write_text(json.dumps({k: v for k, v in parcel.items() if k not in ("polygon", "raw", "feature")}, indent=1, default=str))
+
+
+def load_state(out):
+    out = Path(out)
+    parcel = json.loads((out / "parcel.json").read_text())
+    from shapely import force_2d
+    parcel["polygon"] = force_2d(shape(json.loads((out / "parcel.geojson").read_text())["geometry"]))
+    if parcel["polygon"].geom_type == "MultiPolygon": parcel["polygon"] = max(parcel["polygon"].geoms, key=lambda g: g.area)
+    layout = json.loads((out / "layout.json").read_text())
+    maps = json.loads((out / "maps.json").read_text())
+    scan = json.loads((out / "scan.json").read_text()) if (out / "scan.json").exists() else {}
+    return parcel, layout, maps, scan
+
+
+def crop_box(img, pts, margin, keep_horizon=False):
+    """Crop window (left, top, w, h) around the polygon: bbox + margin, 4:3. keep_horizon anchors the bottom and keeps the sky."""
+    xs, ys = zip(*pts); x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    if keep_horizon:
+        w = max((x1 - x0) * (1 + 2 * margin), (y1 - y0) * (1 + 2 * margin) * 4 / 3)
+        w = min(w, img.width); h = w * 3 / 4
+        bottom = min(img.height, y1 + (y1 - y0) * margin); top = max(0, bottom - h); bottom = top + h
+        if bottom > img.height: top = img.height - h
+        left = min(max(0, (x0 + x1) / 2 - w / 2), img.width - w)
+        return int(left), int(top), int(w), int(h)
+    w, h = (x1 - x0) * (1 + 2 * margin), (y1 - y0) * (1 + 2 * margin)
+    if w / h < 4 / 3: w = h * 4 / 3
+    else: h = w * 3 / 4
+    w, h = min(w, img.width), min(h, img.height)
+    if w / h > 4 / 3: w = h * 4 / 3
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    left = min(max(0, cx - w / 2), img.width - w); top = min(max(0, cy - h / 2), img.height - h)
+    return int(left), int(top), int(w), int(h)
+
+
+def prepare(out, key, rec, layout, variant="", out_size=(1152, 864)):
+    """Source image + ground map (+ boundary pixels) for one output image. Returns (img, gmap, boundary_px) or (None, None, None)."""
+    img = Image.open(out / rec["src"]).convert("RGBA")
+    if rec["kind"] == "satellite":
+        gmap = L.map_from_json(rec["map"]); return img, gmap, [gmap.to_px(x, y) for x, y in layout["boundary"]]
+    pts = rec.get("boundary_px") or []
+    base = L.map_from_json(rec["map"]) if rec.get("map") else None
+    if layout.get("boundary_edited") and base: pts = [base.to_px(x, y) for x, y in layout["boundary"]]
+    if not pts and base: pts = [base.to_px(x, y) for x, y in layout["boundary"]]
+    if not pts: return None, None, None
+    if rec["kind"] == "photo":
+        return img, base, [tuple(p) for p in pts]
+    margin = {"": 0.40 if rec["view"] != "nadir" else 0.25, "close": 0.10}[variant]
+    left, top, w, h = crop_box(img, pts, margin, keep_horizon=rec.get("low") and variant == "")
+    crop = img.crop((left, top, left + w, top + h)).resize(out_size, Image.LANCZOS)
+    sx, sy = out_size[0] / w, out_size[1] / h
+    bpx = [((x - left) * sx, (y - top) * sy) for x, y in pts]
+    gmap = L.CropMap(base, left, top, sx, sy, *out_size) if base else None
+    return crop, gmap, bpx
+
+
+def draw_one(out, key, rec, parcel, layout, scan, variant=""):
+    """Render one output image from its clean source + ground map (+ crop variant). Returns PIL image or None."""
+    img, gmap, bpx = prepare(out, key, rec, layout, variant)
+    if img is None: return None
+    if rec["kind"] == "satellite":
+        return L.render(img, gmap, layout, parcel, pois=scan.get("pois", [])[:3] if rec.get("pois") else [])
+    if rec["kind"] == "photo" and gmap is None:                 # corners only: boundary + card at the polygon centre
+        class _C:
+            def to_px(self_, lon, lat): return (sum(p[0] for p in bpx) / len(bpx), sum(p[1] for p in bpx) / len(bpx))
+        return L.render(img, _C(), layout, parcel, boundary_px=bpx, show_labels=False)
+    if gmap is None:                                            # weak fit: boundary + card only, no feature callouts
+        class _M:
+            def to_px(self_, lon, lat): return (sum(p[0] for p in bpx) / len(bpx), sum(p[1] for p in bpx) / len(bpx))
+        return L.render(img, _M(), layout, parcel, boundary_px=bpx, show_labels=False)
+    return L.render(img, gmap, layout, parcel, boundary_px=bpx)
+
+
+def editor_payload(out, key, variant=""):
+    """What the web editor needs for one image: the clean image (data URL), its size, and the layout in that image's pixels."""
+    import base64
+    out = Path(out); parcel, layout, maps, scan = load_state(out)
+    rec = maps[key]; img, gmap, bpx = prepare(out, key, rec, layout, variant)
+    if img is None or gmap is None: return None
+    buf = io.BytesIO(); img.convert("RGB").save(buf, "JPEG", quality=88)
+    lp = L.layout_px(layout, gmap); lp["boundary"] = [list(p) for p in bpx]
+    return {"key": key, "image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), "W": img.width, "H": img.height, "layout": lp}
+
+
+def apply_edits(out, key, edits, variant=""):
+    """Fold editor output (pixel space of `key`) into layout.json, then rebuild everything. Returns (zip, n)."""
+    out = Path(out); parcel, layout, maps, scan = load_state(out)
+    rec = maps[key]; img, gmap, bpx = prepare(out, key, rec, layout, variant)
+    new = L.apply_px_edits(layout, edits, gmap)
+    if edits.get("boundary_edited"): new["boundary_edited"] = True
+    if edits.get("card"):
+        t = edits["card"].get("title", "")
+        import re as _re
+        mm = _re.search(r"([\d.]+)\s*ACRES", t.upper())
+        if mm:
+            try: parcel["acres"] = float(mm.group(1))
+            except ValueError: pass
+    if new.get("boundary_edited"):
+        parcel["acres"] = round(ls.acres_from_polygon(Polygon(new["boundary"])), 2) if not edits.get("card") else parcel["acres"]
+        new["card"]["title"] = f"{parcel['acres']:.2f} ACRES +/-" if not edits.get("card") else new["card"]["title"]
+    (out / "layout.json").write_text(json.dumps(new, indent=1))
+    (out / "parcel.json").write_text(json.dumps({k: v for k, v in parcel.items() if k not in ("polygon", "raw", "feature")}, indent=1, default=str))
+    return finalize(out)
+
+
+def finalize(out):
+    """Draw every image from layout.json + maps.json, write the packet folder + zip. No API calls. Returns (zip path, n images)."""
+    out = Path(out); parcel, layout, maps, scan = load_state(out)
+    meta = maps.get("_meta", {}); model = meta.get("model", "grok"); angles = meta.get("angles", []); lights = meta.get("lights", []); low = meta.get("low", [])
+    files = {}
+    for key, rec in maps.items():
+        if key.startswith("_"): continue
+        if rec["kind"] == "satellite":
+            g = draw_one(out, key, rec, parcel, layout, scan)
+            if g is not None: g.convert("RGB").save(out / f"{key}.png"); files[key] = out / f"{key}.png"
+            continue
+        if rec["kind"] == "photo":
+            g = draw_one(out, key, rec, parcel, layout, scan)
+            if g is not None: g.convert("RGB").save(out / f"{key}_with_lines.jpg", quality=94); files[key] = out / f"{key}_with_lines.jpg"
+            continue
+        for variant in ("", "close"):
+            if variant == "close" and rec.get("low"): continue
+            g = draw_one(out, key, rec, parcel, layout, scan, variant)
+            if g is None: continue
+            name = f"{key}{'_' + variant if variant else ''}_outline.jpg"
+            g.convert("RGB").save(out / "ai" / name, quality=94); files[key + (":" + variant if variant else "")] = out / "ai" / name
+    # plat
+    try:
+        import plat
+        pf = plat.draw_plat(parcel, scan, layout, out / "plat.png"); files["plat"] = pf
+    except Exception as e:
+        log("plat", "skipped", err=str(e)[:120])
+    # packet in Zillow order: golden cover, low views, angles, close-ups, satellite, day set, plat, raw renders
+    name = f"packet_{(parcel.get('situs') or parcel['apn']).replace(' ', '_')}_{parcel.get('city', '')}".replace("__", "_").rstrip("_")
     pk = out / name; shutil.rmtree(pk, ignore_errors=True); pk.mkdir()
     order = []
-    def add(src, label):
-        if Path(src).exists(): order.append((src, label))
-    lab = lambda v: ("closeup_from_" if v.endswith("_close") else "drone_from_") + v.replace("_close", "")
-    add(out / "ai" / f"{a.model}_nadir_golden_outline.jpg", "overhead_golden_hour_with_lines")
-    for v in angles:
-        add(out / "ai" / f"{a.model}_{v}_golden_outline.jpg", f"{lab(v)}_golden_hour_with_lines")
-    for v in angles[:3]:
-        add(out / "ai" / f"{a.model}_{v}_golden_close_outline.jpg", f"closeup_from_{v}_golden_hour_with_lines")
-    add(out / "p1_cover.png", "satellite_cover_with_lines")
-    add(out / "ai" / f"{a.model}_nadir_day_outline.jpg", "overhead_day_with_lines")
-    for v in angles:
-        add(out / "ai" / f"{a.model}_{v}_day_outline.jpg", f"{lab(v)}_day_with_lines")
-    for v in ["nadir"] + angles:
-        for l in lights:
-            if not (out / "ai" / f"{a.model}_{v}_{l}_outline.jpg").exists():
-                add(out / "ai" / f"{a.model}_{v}_{l}.jpg", f"drone_from_{v}_{l}_no_lines")
-    add(out / "p1_wide.png", "satellite_neighborhood_context"); add(out / "p1_tight.png", "satellite_closeup_with_lines"); add(out / "p1_clean_cover.png", "satellite_clean")
+    def add(k, label):
+        if k in files and Path(files[k]).exists(): order.append((files[k], label))
+    lab = lambda v: f"drone_from_{v}"
+    add("photo_golden", "drone_photo_golden_hour_with_lines"); add("photo_original", "drone_photo_with_lines")
+    add(f"{model}_nadir_golden", "overhead_golden_hour_with_lines")
+    for v in low: add(f"{model}_{v}_low_golden", f"low_view_from_{v}_golden_hour_with_lines")
+    for v in angles: add(f"{model}_{v}_golden", f"{lab(v)}_golden_hour_with_lines")
+    for v in angles[:3]: add(f"{model}_{v}_golden:close", f"closeup_from_{v}_golden_hour_with_lines")
+    add("p1_cover", "satellite_cover_with_lines")
+    add("plat", "plat_map")
+    add(f"{model}_nadir_day", "overhead_day_with_lines")
+    for v in low: add(f"{model}_{v}_low_day", f"low_view_from_{v}_day_with_lines")
+    for v in angles: add(f"{model}_{v}_day", f"{lab(v)}_day_with_lines")
+    add("p1_wide", "satellite_neighborhood_context"); add("p1_tight", "satellite_closeup_with_lines")
+    for k, rec in maps.items():
+        if not k.startswith("_") and rec["kind"] == "render" and (out / rec["src"]).exists():
+            order.append((out / rec["src"], f"{k.split('_', 1)[1]}_no_lines"))
+    if (out / "p1_cover_clean.png").exists(): order.append((out / "p1_cover_clean.png", "satellite_clean"))
+    if (out / "photo_golden_clean.jpg").exists(): order.append((out / "photo_golden_clean.jpg", "drone_photo_golden_hour_no_lines"))
     for i, (src, label) in enumerate(order, 1):
         shutil.copy(src, pk / f"{i:02d}_{label}{Path(src).suffix}")
     (pk / "README.txt").write_text(
-        f"{parcel['situs']}, {parcel['city']}, {parcel['state']} {parcel['zip']}  --  listing photo packet\n"
-        f"PIN {parcel['apn']}  |  {parcel['acres']} acres  |  {parcel.get('use_desc','')}\n\nScene scan used for the renders:\n  {desc}\n\n"
+        f"{parcel.get('situs', '')}, {parcel.get('city', '')}, {parcel.get('state', '')} {parcel.get('zip', '')}  --  listing photo packet\n"
+        f"PIN {parcel['apn']}  |  {parcel.get('acres')} acres  |  {parcel.get('use_desc', '')}\n\nScene scan used for the renders:\n  {scan.get('scene_description', '')}\n\n"
         "Files are numbered in the recommended Zillow order (cover first). Lines, pin and acreage come from the county parcel polygon;\n"
         "on AI renders the line is where the model carried the boundary marker, so treat it as approximate (disclaimer is on-image).\n"
-        "AI renders: Grok Image 2.0 via Higgsfield from Google satellite imagery. Review each image before publishing.\n")
-    shutil.copy(out / "scan.json", pk / "scan.json")
+        "Callouts (POND, DRIVEWAY, ELECTRIC LINES, BUILDING, TIMBER/PASTURE) come from public GIS/OSM data and the satellite image; the plat is drawn\n"
+        "from the GIS parcel polygon and is not a survey. AI renders: Grok Image 2.0 via Higgsfield from Google satellite imagery. Review each image before publishing.\n")
+    for extra in ("scan.json", "layout.json"):
+        if (out / extra).exists(): shutil.copy(out / extra, pk / extra)
     zp = out / f"{name}.zip"
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
         for f in sorted(pk.iterdir()): z.write(f, f.name)
-    (out / "run.json").write_text(json.dumps({"parcel": {k: v for k, v in parcel.items() if k not in ("polygon", "raw", "feature")}, "plan": plan, "seconds": round(time.time() - t0), "calls": LOG}, indent=2))
-    print(f"done in {round(time.time()-t0)}s → {zp}  ({len(order)} images)")
+    return zp, len(order)
 
 
 if __name__ == "__main__":
