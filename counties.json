@@ -223,6 +223,30 @@
     },
     "reverse_geocode": true
   },
+  "cass-mo": {
+    "name": "Cass County, MO",
+    "kind": "camavision",
+    "scan": "federal",
+    "wfs": "https://maps.camavision.com/cassmo",
+    "geom_layer": "search",
+    "pin_field": "parcelid",
+    "pin_normalize": "loose",
+    "fields": {
+      "situs": "address",
+      "acres": "grossacres",
+      "owner": "deedhold",
+      "use": "class",
+      "legal": "legal",
+      "city": "city",
+      "zip": "zip"
+    },
+    "defaults": {
+      "state": "MO",
+      "county": "Cass"
+    },
+    "reverse_geocode": true,
+    "_note": "Vanguard CAMAvision map (WFS). 'parcels' has attributes + envelope only; polygons come from the 'search' layer matched by envelope. Parcel ids look like 120419000000003001 (short_pid 3.001)."
+  },
   "regrid": {
     "name": "Any county (Regrid \u2014 needs a Regrid API plan)",
     "kind": "regrid",

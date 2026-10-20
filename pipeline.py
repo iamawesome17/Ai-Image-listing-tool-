@@ -95,8 +95,70 @@ def reverse_geocode(lat, lon):
         return {}
 
 
+def _merc_to_ll(x, y):
+    R = 6378137.0
+    return (math.degrees(x / R), math.degrees(2 * math.atan(math.exp(y / R)) - math.pi / 2))
+
+
+def fetch_parcel_camavision(cfg, pin=None, lat=None, lon=None):
+    """CAMAvision (Vanguard) county maps: WFS 'parcels' gives attributes + envelope (no geometry), the 'search' layer gives polygons;
+    we match the polygon whose bbox equals the parcel envelope. Coordinates come back in EPSG:3857."""
+    base = cfg["wfs"]; F = cfg["fields"]; pinf = cfg.get("pin_field", "parcelid")
+    def wfs(params):
+        q = {"SERVICE": "WFS", "VERSION": "1.1.0", "REQUEST": "GetFeature", **params}
+        log("parcel", "GET " + base + " (WFS " + params.get("TYPENAME", "") + ")")
+        return ls.http_bytes(base + "?" + urllib.parse.urlencode(q), timeout=40).decode("utf-8", "ignore")
+    feat = None
+    if pin:
+        for v in pin_variants(pin, cfg.get("pin_normalize", "loose")):
+            flt = f'<ogc:Filter xmlns:ogc="http://www.opengis.net/ogc"><ogc:PropertyIsLike wildCard="*" singleChar="." escapeChar="!"><ogc:PropertyName>{pinf}</ogc:PropertyName><ogc:Literal>{v}</ogc:Literal></ogc:PropertyIsLike></ogc:Filter>'
+            xml = wfs({"TYPENAME": "parcels", "FILTER": flt, "MAXFEATURES": 5})
+            members = xml.split("<gml:featureMember>")[1:]
+            if members: feat = members[0]; break
+    else:
+        R = 6378137.0; x = math.radians(lon) * R; y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * R
+        xml = wfs({"TYPENAME": "parcels", "BBOX": f"{x-1},{y-1},{x+1},{y+1},EPSG:3857", "MAXFEATURES": 5})
+        members = xml.split("<gml:featureMember>")[1:]
+        if members: feat = members[0]
+    if not feat:
+        sys.exit(f"No parcel found in {cfg['name']} for that parcel number / point. Check the number as it appears on the county assessor site.")
+    attrs = {k: v for k, v in re.findall(r"<ms:([A-Za-z0-9_]+)>([^<]*)</ms:\1>", feat)}
+    m = re.search(r"<gml:lowerCorner>([-\d.]+) ([-\d.]+)</gml:lowerCorner>\s*<gml:upperCorner>([-\d.]+) ([-\d.]+)", feat)
+    if not m: sys.exit("CAMAvision parcel has no envelope.")
+    x0, y0, x1, y1 = map(float, m.groups())
+    xml = wfs({"TYPENAME": cfg.get("geom_layer", "search"), "BBOX": f"{x0},{y0},{x1},{y1},EPSG:3857", "MAXFEATURES": 400})
+    poly = None
+    for mem in xml.split("<gml:featureMember>")[1:]:
+        mb = re.search(r"<gml:lowerCorner>([-\d.]+) ([-\d.]+)</gml:lowerCorner>\s*<gml:upperCorner>([-\d.]+) ([-\d.]+)", mem)
+        if not mb: continue
+        if max(abs(float(a) - b) for a, b in zip(mb.groups(), (x0, y0, x1, y1))) > 0.5: continue
+        pl = re.search(r"<gml:posList[^>]*>([^<]+)</gml:posList>", mem)
+        if not pl: continue
+        nums = list(map(float, pl.group(1).split()))
+        ring = [_merc_to_ll(nums[i], nums[i + 1]) for i in range(0, len(nums) - 1, 2)]
+        if len(ring) >= 4: poly = Polygon(ring); break
+    if poly is None: sys.exit("CAMAvision returned the parcel record but no polygon for it.")
+    g = lambda k: attrs.get(F[k]) if k in F and F[k] in attrs else None
+    acres = g("acres")
+    try: acres = float(acres) if acres not in (None, "") else None
+    except ValueError: acres = None
+    feature = {"type": "Feature", "geometry": poly.__geo_interface__, "properties": attrs}
+    norm = {"PIN": attrs.get(pinf), "SiteAddress": g("situs"), "Acres": acres, "OwnerName": g("owner"), "UseCode": str(g("use") or "").strip(),
+            "LegalDesc": g("legal"), "county": cfg.get("defaults", {}).get("county"), "city": g("city"), "zip": str(g("zip") or "")[:5] or None}
+    parcel = ls.parcel_from_feature({"geometry": poly.__geo_interface__, "properties": norm}, cfg.get("defaults", {}))
+    if cfg.get("reverse_geocode") or not parcel["city"]:
+        c = poly.centroid; rg = reverse_geocode(c.y, c.x)
+        parcel["city"] = parcel["city"] or rg.get("city", ""); parcel["zip"] = parcel["zip"] or rg.get("zip", "")
+        if not parcel["situs"] and rg.get("street"): parcel["situs"] = rg["street"]
+    parcel["use_desc"] = cfg.get("use_codes", {}).get(parcel["use"], parcel["use"].lower() if parcel["use"] and not parcel["use"].isdigit() else "land")
+    parcel["feature"] = feature
+    return parcel
+
+
 def fetch_parcel_county(cfg, pin=None, lat=None, lon=None):
     """Parcel from a county or statewide ArcGIS parcel layer, normalized to the pipeline's parcel dict."""
+    if cfg.get("kind") == "camavision":
+        return fetch_parcel_camavision(cfg, pin, lat, lon)
     url = cfg.get("parcels_url") or f"{cfg['server']}/{cfg['layers']['parcels']}"
     F = cfg["fields"]; d = {}
     if pin:
@@ -668,7 +730,8 @@ def main():
 
     # 1 parcel
     print("1/7 parcel", flush=True)
-    sources = json.loads((HERE / "counties.json").read_text()); fed = sources["_federal"]
+    import sources as S
+    sources = S.load_sources(); fed = sources["_federal"]
     cfg = sources.get(a.county or "regrid")
     if a.boundary:
         import boundary_file

@@ -15,8 +15,17 @@ from PIL import Image, ImageDraw, ImageOps
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
-COUNTIES = {k: v for k, v in json.loads((HERE / "counties.json").read_text()).items() if not k.startswith("_")}
-COUNTY_LABELS = {k: v.get("name", k) for k, v in COUNTIES.items()}
+import sources as S
+
+
+def county_table():
+    global COUNTIES, COUNTY_LABELS
+    COUNTIES = {k: v for k, v in S.load_sources().items() if not k.startswith("_")}
+    COUNTY_LABELS = {k: v.get("name", k) for k, v in COUNTIES.items()}
+    return COUNTIES
+
+
+county_table()
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 try:
     import listing_shot as _ls; _ls.load_env(str(HERE / ".env"))          # local runs: keys from .env / keys.env; Railway: env vars
@@ -72,6 +81,24 @@ def pick_run(out_dir):
     if not out_dir: return gr.update(), None
     items = editable_images(out_dir)
     return gr.update(choices=items, value=items[0][1] if items else None), out_dir
+
+
+def sources_markdown():
+    rows = ["| Source | Type | Parcel-number field | Added |", "|---|---|---|---|"]
+    for k, v in county_table().items():
+        rows.append(f"| {v.get('name', k)} | {v.get('kind')} | `{v.get('pin_field', '—')}` | {'app' if v.get('added_by') == 'app' else 'built-in'} |")
+    return "\n".join(rows)
+
+
+def add_county(state, county, url, progress=gr.Progress()):
+    progress(0.2, desc="Looking for the county's parcel service…")
+    try:
+        key, cfg, msg = S.add_source(state, county, url)
+    except Exception as e:
+        raise gr.Error(str(e))
+    county_table()
+    choices = list(COUNTY_LABELS.values())
+    return f"✅ {msg}", sources_markdown(), gr.update(choices=choices, value=cfg["name"]), gr.update(choices=choices, value=cfg["name"])
 
 
 def open_editor(out_dir):
@@ -384,6 +411,16 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
             erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
             eruns.change(pick_run, [eruns], [ekey, run_dir])
+        with gr.Tab("Counties", id="counties"):
+            gr.Markdown('<div class="help">Statewide sources cover every parcel in that state. For a county that is not listed, add it here: give the state and county, and either leave the URL blank (the app searches arcgis.com for the county\'s public parcel layer) or paste the parcel layer\'s REST URL from the county GIS site (…/MapServer/&lt;n&gt; or …/FeatureServer/&lt;n&gt;), or a CAMAvision map link (maps.camavision.com/…) — the pattern many Missouri and Iowa counties use. The county is checked live before it is saved.</div>')
+            with gr.Row():
+                cstate = gr.Dropdown([f"{k} — {v}" for k, v in S.STATES.items()], value="MO — Missouri", label="State", scale=1)
+                cname = gr.Textbox(label="County", placeholder="Cass", scale=1)
+                curl = gr.Textbox(label="Parcel layer URL (optional)", placeholder="https://…/MapServer/13  or  https://maps.camavision.com/…", scale=3)
+                cadd = gr.Button("Add county", variant="primary", scale=1)
+            cmsg = gr.Markdown()
+            ctable = gr.Markdown(sources_markdown())
+            cadd.click(lambda st, nm, u: add_county(st.split(" ")[0], nm, u), [cstate, cname, curl], [cmsg, ctable, county, pcounty])
         edit_btn.click(open_editor, [run_dir], [ekey, tabs])
         pedit_btn.click(open_editor, [run_dir], [ekey, tabs])
 
