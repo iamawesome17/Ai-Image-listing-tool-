@@ -82,11 +82,12 @@ def hfov_deg(f35, W, H):
 
 
 # ---------- relight ----------
-def relight_golden(img, pts, parcel_desc=""):
-    """Draw the marker, send to the image model for a golden-hour relight, return the relit image (marker kept)."""
+def relight_golden(img, pts, ref_url=None):
+    """Draw the marker, send to the image model for a golden-hour relight, return the relit image (marker kept).
+    ref_url: optional public URL of an already-marked image (skips the upload)."""
     marked = img.copy(); d = ImageDraw.Draw(marked)
     d.line(pts + [pts[0]], fill=P.FIDUCIAL + (255,), width=max(4, img.width // 300), joint="curve")
-    url = dr.hf_upload_png(marked.convert("RGB"))
+    url = ref_url or dr.hf_upload_png(marked.convert("RGB"))
     prompt = ("Re-light this exact aerial photograph as golden hour: low warm sunset light from the west, long soft shadows, warm "
               "glowing sky at the horizon, slightly richer colors. Keep the framing, perspective, every road, tree, building and "
               "field exactly as they are; do not add, move or remove anything. A thin magenta line is painted on the ground marking "
@@ -100,7 +101,7 @@ def relight_golden(img, pts, parcel_desc=""):
 
 
 # ---------- main ----------
-def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None):
+def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref_url=None):
     img = ImageOps.exif_transpose(Image.open(photo_path)).convert("RGBA")
     meta = read_metadata(photo_path)
     source = "manual points"
@@ -117,13 +118,15 @@ def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None):
     results = {"source": source, "meta": meta, "points": pts}
     variants = [("original", img)]
     if golden:
-        relit = relight_golden(img, pts)
+        relit = relight_golden(img, pts, ref_url)
+        if relit.size != img.size:                              # model may return a different size: bring it back to ours
+            relit = relit.resize(img.size, Image.LANCZOS)
         det, q = P.detect_fiducial(relit)
         if det:
             clean, _ = P.erase_markers(relit, q.get("_mask"), [], [])
             relit_pts = det
         else:                                                   # marker lost → trust the geometry, no erase needed
-            clean, relit_pts = relit, [(x * relit.width / img.width, y * relit.height / img.height) for x, y in pts]
+            clean, relit_pts = relit, pts
         variants.append(("golden", (clean, relit_pts)))
     labels = []
     if scan and meta:                                   # camera sits opposite its heading: bearing of camera from the parcel
@@ -131,7 +134,7 @@ def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None):
     files = []
     for name, v in variants:
         im, p = (v if isinstance(v, tuple) else (v, pts))
-        g = P.draw_graphics(im, p, parcel, labels if name == "original" else [])
+        g = P.draw_graphics(im, p, parcel, labels)
         f = out_dir / f"{stem}_{name}_with_lines.jpg"; g.convert("RGB").save(f, quality=94); files.append(str(f))
         if name == "golden":
             f2 = out_dir / f"{stem}_golden_no_lines.jpg"; im.convert("RGB").save(f2, quality=94); files.append(str(f2))

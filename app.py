@@ -1,129 +1,190 @@
 """
-app.py — web front end for the listing photo pipeline (Gradio).
+app.py — Bana Listing Photos web app (Gradio).
 
-Run locally:   python app.py            → http://localhost:7860
-Deploy:        see PROCESS.md → "Hosting". Needs the same .env keys as pipeline.py plus APP_PASSWORD.
+Tabs:
+  1. Generate from parcel   county + PIN → satellite set + AI drone views with property lines → zip
+  2. Real drone photo       upload a drone photo → property line (DJI metadata or clicked corners) + optional golden-hour relight
 
-The form takes a county + PIN (or lat/lon), runs pipeline.py, and shows the packet images with a zip download.
+Run locally:  python app.py  → http://localhost:7860      Deploy: see README.md (Railway).
+Env: REGRID_TOKEN, GOOGLE_MAPS_KEY, HIGGSFIELD_KEY, APP_PASSWORD (login user is "bana").
 """
-import os, subprocess, sys, json, time, shutil
+import os, subprocess, sys, json, time
 from pathlib import Path
 import gradio as gr
+from PIL import Image, ImageDraw, ImageOps
 
 HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
 COUNTIES = json.loads((HERE / "counties.json").read_text())
+COUNTY_LABELS = {k: v.get("name", k) for k, v in COUNTIES.items()}
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 
-def run(county, pin, lat, lon, angles, lights, render):
+# ---------------- tab 1: generate from parcel ----------------
+def run(county_label, pin, lat, lon, angles, lights, render, progress=gr.Progress()):
+    county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
-    if not pin and not (lat and lon):          # Gradio shows empty numbers as 0
-        raise gr.Error("Enter a PIN, or both a latitude and a longitude.")
+    if not pin and not (lat and lon):
+        raise gr.Error("Enter a parcel number, or both a latitude and a longitude.")
     cmd = [sys.executable, str(HERE / "pipeline.py"), "--county", county, "--angles", angles, "--lights", lights]
     cmd += ["--pin", pin] if pin else ["--lat", str(lat), "--lon", str(lon)]
     if not render: cmd.append("--no-render")
+    progress(0.05, desc="Parcel + surroundings scan…")
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=1800)
-    log = proc.stdout + proc.stderr
+    proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    log, stage = [], 0.05
+    marks = {"2/7": (0.15, "Scanning surroundings…"), "4/7": (0.25, "Annotated satellite set…"), "5/7": (0.35, "Rendering drone views (1–2 min)…"),
+             "6/7": (0.85, "Placing property lines…"), "7/7": (0.95, "Packing zip…")}
+    for line in proc.stdout:
+        log.append(line.rstrip())
+        for k, (v, d) in marks.items():
+            if line.startswith(k): stage = v; progress(stage, desc=d)
+    proc.wait()
+    text = "\n".join(log)
     if proc.returncode != 0:
-        raise gr.Error("Run failed — see log.\n" + log[-2000:])
-    # locate outputs
-    m = [l for l in log.splitlines() if l.startswith("done")]
+        raise gr.Error("Run failed — see the log below.\n" + text[-1500:])
     out_dir = None
-    for line in log.splitlines():
-        if "done in" in line and "→" in line:
+    for line in log:
+        if line.startswith("done") and "→" in line:
             out_dir = Path(line.split("→")[1].strip().split(" ")[0]).parent
     if out_dir is None:
-        for line in log.splitlines():
-            if line.startswith("4/7") or line.startswith("done (phase 1"): pass
         out_dir = sorted((HERE / "out").glob("*"), key=lambda p: p.stat().st_mtime)[-1]
-    zips = sorted(out_dir.glob("packet_*.zip"), key=lambda p: p.stat().st_mtime)
     pk = sorted([p for p in out_dir.glob("packet_*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
+    zips = sorted(out_dir.glob("packet_*.zip"), key=lambda p: p.stat().st_mtime)
     images = sorted(pk[-1].glob("*.jpg")) + sorted(pk[-1].glob("*.png")) if pk else sorted(out_dir.glob("p1_*.png"))
     scan = json.loads((out_dir / "scan.json").read_text()).get("scene_description", "") if (out_dir / "scan.json").exists() else ""
-    return [str(p) for p in images], (str(zips[-1]) if zips else None), f"{scan}\n\nDone in {round(time.time()-t0)}s\n\n" + log[-3000:]
+    summary = f"**{len(images)} images · {round(time.time()-t0)} s**\n\n{scan}"
+    return [(str(p), p.stem.replace("_", " ")) for p in images], (str(zips[-1]) if zips else None), summary, text[-4000:]
 
 
-def photo_points_add(img, pts, evt: gr.SelectData):
-    pts = list(pts or []); pts.append([float(evt.index[0]), float(evt.index[1])])
-    return pts, draw_points(img, pts), f"{len(pts)} corner(s) marked"
+# ---------------- tab 2: real drone photo ----------------
+def _load(path):
+    return ImageOps.exif_transpose(Image.open(path)).convert("RGB")
 
 
-def photo_points_clear(img):
-    return [], img, "0 corners marked"
-
-
-def draw_points(img, pts):
-    from PIL import Image, ImageDraw, ImageOps
-    if img is None: return None
-    im = ImageOps.exif_transpose(Image.open(img)).convert("RGB") if isinstance(img, str) else img.convert("RGB").copy()
-    d = ImageDraw.Draw(im); r = max(6, im.width // 150)
-    if len(pts) >= 2: d.line([tuple(p) for p in pts] + ([tuple(pts[0])] if len(pts) >= 3 else []), fill=(255, 0, 255), width=max(3, im.width // 400))
-    for x, y in pts: d.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 255), outline="white", width=2)
+def draw_points(path, pts):
+    if path is None: return None
+    im = _load(path); d = ImageDraw.Draw(im); r = max(6, im.width // 150)
+    if len(pts) >= 2:
+        d.line([tuple(p) for p in pts] + ([tuple(pts[0])] if len(pts) >= 3 else []), fill=(255, 0, 255), width=max(3, im.width // 400))
+    for x, y in pts:
+        d.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 255), outline="white", width=2)
     return im
 
 
-def run_photo(photo_path, county, pin, golden, pts):
+def photo_uploaded(path):
     import drone_photo as D
+    meta = D.read_metadata(path) if path else None
+    if meta:
+        msg = f"✅ Drone metadata found ({meta['model'] or 'camera'}, {meta['alt_m']:.0f} m up, heading {meta['yaw']:.0f}°, tilt {meta['pitch']:.0f}°) — the property line will be placed automatically. You can still click corners to override."
+    else:
+        msg = "ℹ️ No drone metadata in this file — click the parcel corners on the photo, in order around the boundary."
+    return path, [], msg
+
+
+def photo_click(path, pts, evt: gr.SelectData):
+    pts = list(pts or []) + [[float(evt.index[0]), float(evt.index[1])]]
+    return pts, draw_points(path, pts), f"{len(pts)} corner{'s' if len(pts) != 1 else ''} marked"
+
+
+def photo_clear(path):
+    return [], (_load(path) if path else None), "Corners cleared"
+
+
+def run_photo(path, county_label, pin, golden, pts, progress=gr.Progress()):
+    import drone_photo as D, listing_shot as ls, pipeline as P
+    county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
-    if not photo_path: raise gr.Error("Upload a drone photo.")
-    if not pin: raise gr.Error("Enter the parcel PIN (for the property line and the acreage card).")
-    import listing_shot as ls, pipeline as P
+    if not path: raise gr.Error("Upload a drone photo first.")
+    if not pin: raise gr.Error("Enter the parcel number — it supplies the property line and the acreage card.")
+    progress(0.1, desc="Parcel lookup…")
     cfg = COUNTIES[county]; parcel = P.fetch_parcel_county(cfg, pin)
     scan = None
     try:
-        from PIL import Image
+        progress(0.25, desc="Surroundings scan…")
         poly = parcel["polygon"]; c = poly.centroid
         z = ls.choose_zoom(poly, 640, 480, margin=0.22); fr = ls.Frame(c.y, c.x, z, 640, 480)
         scan = P.scan_surroundings(cfg, parcel, ls.fetch_satellite(fr), fr)
     except Exception:
         scan = None
     points = [tuple(p) for p in pts] if pts and len(pts) >= 3 else None
+    progress(0.4, desc="Golden-hour relight (≈1 min)…" if golden else "Drawing lines…")
     try:
-        r = D.annotate(photo_path, parcel, scan, points, golden, out_dir=HERE / "out" / parcel["apn"] / "photos")
+        r = D.annotate(path, parcel, scan, points, golden, out_dir=HERE / "out" / parcel["apn"] / "photos")
     except RuntimeError as e:
         raise gr.Error(str(e))
-    note = f"Property line from: {r['source']}." + ("" if r.get("meta") is None else f"  Camera: {r['meta']['model']} alt {r['meta']['alt_m']:.0f} m, yaw {r['meta']['yaw']:.0f}°, pitch {r['meta']['pitch']:.0f}°.")
-    return r["files"], note
+    note = f"Property line from **{r['source']}**."
+    if r.get("meta"):
+        m = r["meta"]; note += f" Camera: {m['model'] or 'drone'}, {m['alt_m']:.0f} m up, heading {m['yaw']:.0f}°, tilt {m['pitch']:.0f}°."
+    note += " Check the line against what you know of the property — metadata placement is approximate (a few metres)."
+    return [(f, Path(f).stem.replace("_", " ")) for f in r["files"]], note
 
 
-with gr.Blocks(title="Bana Listing Photos") as demo:
-    gr.Markdown("# Bana listing photo packet\nParcel in → annotated satellite set + AI drone views with property lines, out.")
+# ---------------- UI ----------------
+THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.emerald, secondary_hue=gr.themes.colors.stone, neutral_hue=gr.themes.colors.stone,
+    font=[gr.themes.GoogleFont("Poppins"), "system-ui", "sans-serif"], radius_size=gr.themes.sizes.radius_md,
+).set(body_background_fill="#f6f5f1", block_background_fill="#ffffff", block_border_width="1px", block_shadow="0 1px 2px rgba(0,0,0,.04)",
+      button_primary_background_fill="#1f6f4a", button_primary_background_fill_hover="#185a3c", button_primary_text_color="#ffffff",
+      block_label_background_fill="#f1f0ec", block_label_text_color="#44423d", block_title_text_color="#44423d",
+      checkbox_background_color_selected="#1f6f4a", checkbox_border_color_selected="#1f6f4a")
+
+CSS = """
+.gradio-container {max-width: 1180px !important; margin: 0 auto !important;}
+#hero {padding: 26px 28px 18px; border-radius: 14px; background: linear-gradient(135deg,#17352a 0%,#1f6f4a 60%,#2f8f5f 100%); color: #fff; margin-bottom: 8px;}
+#hero h1 {margin: 0 0 4px; font-size: 26px; font-weight: 600; letter-spacing: -.2px; color:#fff;}
+#hero p {margin: 0; color: #e7f1ea !important; font-size: 14px;}
+.tab-nav button {font-weight: 600 !important;}
+.help {color:#5c5a55; font-size:13px; margin: -4px 0 6px;}
+footer {display:none !important;}
+.gallery-item img {object-fit: cover;}
+"""
+
+with gr.Blocks(title="Bana Listing Photos", theme=THEME, css=CSS) as demo:
+    gr.HTML('<div id="hero"><h1>Bana Listing Photos</h1><p>Parcel number in → listing-ready images out: true property lines on satellite and AI drone views, or on your own drone photos.</p></div>')
+
     with gr.Tab("Generate from parcel"):
-      with gr.Row():
-          county = gr.Dropdown(list(COUNTIES), value=list(COUNTIES)[0], label="County")
-          pin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
-      with gr.Row():
-          lat = gr.Number(label="…or latitude", value=None); lon = gr.Number(label="longitude", value=None)
-      with gr.Row():
-          angles = gr.Textbox(value="S,E,W,N", label="Angles (camera side; also NE,SE,SW,NW)")
-          lights = gr.Textbox(value="golden,day", label="Lighting")
-          render = gr.Checkbox(value=True, label="Generate AI drone views (costs ~$0.50)")
-      go = gr.Button("Create packet", variant="primary")
-      gallery = gr.Gallery(label="Packet", columns=4, height=600)
-      zipf = gr.File(label="Download zip")
-      logbox = gr.Textbox(label="Scene scan + log", lines=12)
-      go.click(run, [county, pin, lat, lon, angles, lights, render], [gallery, zipf, logbox])
+        with gr.Row():
+            with gr.Column(scale=1, min_width=320):
+                gr.Markdown("### Property")
+                county = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County")
+                pin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
+                gr.Markdown('<div class="help">…or locate by coordinates</div>')
+                with gr.Row():
+                    lat = gr.Number(label="Latitude", value=None); lon = gr.Number(label="Longitude", value=None)
+                render = gr.Checkbox(value=True, label="Generate AI drone views (≈ $0.60, 1–2 min)")
+                with gr.Accordion("Advanced", open=False):
+                    angles = gr.CheckboxGroup(["S", "E", "W", "N", "NE", "SE", "SW", "NW"], value=["S", "E", "W", "N"], label="Camera positions")
+                    lights = gr.CheckboxGroup(["golden", "day"], value=["golden", "day"], label="Lighting")
+                go = gr.Button("Create packet", variant="primary", size="lg")
+                summary = gr.Markdown()
+                zipf = gr.File(label="Download packet (zip)")
+            with gr.Column(scale=2):
+                gallery = gr.Gallery(label="Packet", columns=3, height=640, object_fit="cover", show_label=False)
+                with gr.Accordion("Run log", open=False):
+                    logbox = gr.Textbox(lines=14, show_label=False)
+        go.click(lambda c, p, la, lo, a, l, r: run(c, p, la, lo, ",".join(a) or "S", ",".join(l) or "golden", r),
+                 [county, pin, lat, lon, angles, lights, render], [gallery, zipf, summary, logbox])
 
     with gr.Tab("Real drone photo"):
-      gr.Markdown("Upload a drone photo. If it has DJI metadata the property line is placed automatically; otherwise click the parcel corners on the photo in order. Optional golden-hour relight.")
-      with gr.Row():
-        pcounty = gr.Dropdown(list(COUNTIES), value=list(COUNTIES)[0], label="County")
-        ppin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
-        pgolden = gr.Checkbox(value=True, label="Add golden-hour version (costs ~$0.05)")
-      photo = gr.Image(type="filepath", label="Drone photo (click corners here if needed)", height=520)
-      pts_state = gr.State([])
-      with gr.Row():
-        pstatus = gr.Textbox(value="0 corners marked", label="Corners", interactive=False)
-        pclear = gr.Button("Clear corners")
-      pgo = gr.Button("Annotate photo", variant="primary")
-      pgallery = gr.Gallery(label="Results", columns=3, height=520)
-      pnote = gr.Textbox(label="Notes", lines=2)
-      orig_state = gr.State(None)
-      photo.upload(lambda img: (img, [], "0 corners marked"), [photo], [orig_state, pts_state, pstatus])
-      photo.select(photo_points_add, [orig_state, pts_state], [pts_state, photo, pstatus])
-      pclear.click(lambda img: ([], img, "0 corners marked"), [orig_state], [pts_state, photo, pstatus])
-      pgo.click(run_photo, [orig_state, pcounty, ppin, pgolden, pts_state], [pgallery, pnote])
+        with gr.Row():
+            with gr.Column(scale=1, min_width=320):
+                gr.Markdown("### Photo + property")
+                photo = gr.Image(type="filepath", label="Drone photo", height=360, sources=["upload"])
+                pstatus = gr.Markdown('<div class="help">Upload a photo straight from the drone to keep its GPS and gimbal data.</div>')
+                pcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County")
+                ppin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
+                pgolden = gr.Checkbox(value=True, label="Add a golden-hour version (≈ $0.05)")
+                pclear = gr.Button("Clear corners", size="sm")
+                pgo = gr.Button("Annotate photo", variant="primary", size="lg")
+                pnote = gr.Markdown()
+            with gr.Column(scale=2):
+                pgallery = gr.Gallery(label="Results", columns=2, height=640, object_fit="contain", show_label=False)
+        pts_state = gr.State([]); orig_state = gr.State(None)
+        photo.upload(photo_uploaded, [photo], [orig_state, pts_state, pstatus])
+        photo.select(photo_click, [orig_state, pts_state], [pts_state, photo, pstatus])
+        pclear.click(photo_clear, [orig_state], [pts_state, photo, pstatus])
+        pgo.click(run_photo, [orig_state, pcounty, ppin, pgolden, pts_state], [pgallery, pnote])
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=2)
