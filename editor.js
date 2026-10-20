@@ -25,7 +25,7 @@ window.banaEditor = (function () {
 
   function load(p) {
     if (!canvas && !init()) return;
-    st = JSON.parse(JSON.stringify(p.layout)); st.W = p.W; st.H = p.H; st.boundary_edited = false; sel = null; undo = []; mode = "select";
+    st = JSON.parse(JSON.stringify(p.layout)); st.W = p.W; st.H = p.H; st.boundary_edited = !!p.draw; st.mpp = p.mpp || null; st.reference = p.layout.reference || []; sel = null; undo = []; mode = "select";
     img = new Image(); img.onload = () => { fit(); draw(); }; img.src = p.image;
     const ct = $("bana-title"), cs = $("bana-csub"), dc = $("bana-disc");
     if (ct) ct.value = st.card.title; if (cs) cs.value = st.card.sub; if (dc) dc.value = st.disclaimer || "";
@@ -41,6 +41,11 @@ window.banaEditor = (function () {
   function draw() {
     if (!st || !img) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    // reference (parent parcel) — dashed
+    if (st.reference && st.reference.length) {
+      ctx.save(); ctx.setLineDash([S(10), S(8)]); ctx.lineWidth = S(3); ctx.strokeStyle = "rgba(255,220,80,0.9)"; ctx.beginPath();
+      st.reference.forEach((p, i) => (i ? ctx.lineTo(S(p[0]), S(p[1])) : ctx.moveTo(S(p[0]), S(p[1])))); ctx.closePath(); ctx.stroke(); ctx.restore();
+    }
     // boundary
     const b = st.boundary; if (b.length) {
       ctx.beginPath(); b.forEach((p, i) => (i ? ctx.lineTo(S(p[0]), S(p[1])) : ctx.moveTo(S(p[0]), S(p[1])))); ctx.closePath();
@@ -64,6 +69,12 @@ window.banaEditor = (function () {
       ctx.fillStyle = dark ? "#fff" : "#111"; ctx.font = `bold ${S(22)}px Poppins, sans-serif`; ctx.textAlign = "center"; ctx.fillText(l.text || "", bx.x + bx.w / 2, bx.y + S(28));
       if (l.sub) { ctx.font = `${S(16)}px Poppins, sans-serif`; ctx.fillText(l.sub, bx.x + bx.w / 2, bx.y + S(50)); }
     });
+    // live acreage (satellite frames only)
+    if (st.mpp && b.length >= 3) {
+      let a = 0; for (let i = 0; i < b.length; i++) { const p = b[i], q = b[(i + 1) % b.length]; a += p[0] * q[1] - q[0] * p[1]; }
+      const acres = Math.abs(a) / 2 * st.mpp * st.mpp / 4046.8564; st.acres = acres;
+      const el = $("bana-acres"); if (el) el.textContent = "≈ " + acres.toFixed(2) + " acres";
+    }
     // disclaimer
     ctx.font = `bold ${S(20)}px Poppins, sans-serif`; ctx.textAlign = "right"; ctx.fillStyle = "#fff"; ctx.shadowColor = "#000"; ctx.shadowBlur = 4; ctx.fillText(st.disclaimer || "", canvas.width - S(28), canvas.height - S(44)); ctx.shadowBlur = 0;
   }

@@ -1040,7 +1040,12 @@ def editor_payload(out, key, variant=""):
     if img is None or gmap is None: return None
     buf = io.BytesIO(); img.convert("RGB").save(buf, "JPEG", quality=88)
     lp = L.layout_px(layout, gmap); lp["boundary"] = [list(p) for p in bpx]
-    return {"key": key, "image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), "W": img.width, "H": img.height, "layout": lp}
+    lp["reference"] = [list(gmap.to_px(x, y)) for x, y in layout.get("reference", [])]
+    mpp = None
+    if rec["kind"] == "satellite":                               # metres per pixel at the frame centre → live acreage in the editor
+        fr = gmap.frame; mpp = 156543.03392 * math.cos(math.radians(fr.lat)) / (2 ** fr.z) / ls.SCALE
+    return {"key": key, "image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), "W": img.width, "H": img.height, "layout": lp, "mpp": mpp,
+            "draw": bool(maps.get("_meta", {}).get("draw"))}
 
 
 def apply_edits(out, key, edits, variant=""):
@@ -1075,7 +1080,7 @@ def apply_edits(out, key, edits, variant=""):
         if mm:
             try: parcel["acres"] = float(mm.group(1))
             except ValueError: pass
-    if new.get("boundary_edited"):
+    if new.get("boundary_edited") and not parcel.get("no_geo"):
         parcel["acres"] = round(ls.acres_from_polygon(Polygon(new["boundary"])), 2) if not edits.get("card") else parcel["acres"]
         new["card"]["title"] = f"{parcel['acres']:.2f} ACRES +/-" if not edits.get("card") else new["card"]["title"]
     (out / "layout.json").write_text(json.dumps(new, indent=1))
@@ -1103,12 +1108,13 @@ def finalize(out):
             if g is None: continue
             name = f"{key}{'_' + variant if variant else ''}_outline.jpg"
             g.convert("RGB").save(out / "ai" / name, quality=94); files[key + (":" + variant if variant else "")] = out / "ai" / name
-    # plat
-    try:
-        import plat
-        pf = plat.draw_plat(parcel, scan, layout, out / "plat.png"); files["plat"] = pf
-    except Exception as e:
-        log("plat", "skipped", err=str(e)[:120])
+    # plat (not for photos drawn without any parcel geometry)
+    if not parcel.get("no_geo"):
+        try:
+            import plat
+            pf = plat.draw_plat(parcel, scan, layout, out / "plat.png"); files["plat"] = pf
+        except Exception as e:
+            log("plat", "skipped", err=str(e)[:120])
     # packet in Zillow order: golden cover, low views, angles, close-ups, satellite, day set, plat, raw renders
     name = f"packet_{(parcel.get('situs') or parcel['apn']).replace(' ', '_')}_{parcel.get('city', '')}".replace("__", "_").rstrip("_")
     pk = out / name; shutil.rmtree(pk, ignore_errors=True); pk.mkdir()
