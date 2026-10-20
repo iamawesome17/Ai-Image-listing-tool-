@@ -180,8 +180,11 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, rende
     if out_dir is None:
         out_dir = sorted((HERE / "out").glob("*"), key=lambda p: p.stat().st_mtime)[-1]
     images, z = packet_outputs(out_dir)
+    warn = ""
+    if "credit balance is too low" in text: warn = "⚠️ **Higgsfield balance is empty — no AI drone views were generated.** Top up at console.higgsfield.ai and run again (existing satellite images are kept; only the renders are re-done).\n\n"
+    elif "FAILED" in text and render: warn = "⚠️ Some AI renders failed — see the run log.\n\n"
     scan = json.loads((out_dir / "scan.json").read_text()).get("scene_description", "") if (out_dir / "scan.json").exists() else ""
-    summary = f"**{len(images)} images · {round(time.time()-t0)} s** — next step: **Review & edit** to fix any label or line before you ship.\n\n{scan}"
+    summary = warn + f"**{len(images)} images · {round(time.time()-t0)} s** — next step: **Review & edit** to fix any label or line before you ship.\n\n{scan}"
     return images, z, summary, text[-4000:], str(out_dir)
 
 
