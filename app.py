@@ -8,7 +8,7 @@ Tabs:
 Run locally:  python app.py  → http://localhost:7860      Deploy: see README.md (Railway).
 Env: REGRID_TOKEN, GOOGLE_MAPS_KEY, HIGGSFIELD_KEY, APP_PASSWORD (login user is "bana").
 """
-import os, subprocess, sys, json, time
+import os, re, subprocess, sys, json, time
 from pathlib import Path
 import gradio as gr
 from PIL import Image, ImageDraw, ImageOps
@@ -140,7 +140,7 @@ def reset_edits(out_dir):
 
 
 # ---------------- tab 1: generate from parcel ----------------
-def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, render, progress=gr.Progress()):
+def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, render, rstate="", rcounty="", progress=gr.Progress()):
     county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
     if not boundary and not pin and not (lat and lon):
@@ -148,6 +148,12 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, rende
     cmd = [sys.executable, str(HERE / "pipeline.py"), "--county", county, "--angles", angles, "--lights", lights, "--low", low]
     if boundary:
         cmd += ["--boundary", boundary] + (["--label", label] if label else [])
+    elif COUNTIES[county].get("kind") == "realie":
+        st = (rstate or "").split(" ")[0].strip().upper(); cn = (rcounty or "").strip()
+        if not st: raise gr.Error("Realie needs the state (and county for a parcel number).")
+        looks_addr = bool(re.match(r"^\s*\d+\s+[A-Za-z]", pin))
+        cmd += ["--state", st] + (["--county-name", cn] if cn else []) + (["--address", pin] if looks_addr else ["--pin", pin])
+        if not looks_addr and not cn: raise gr.Error("Realie needs the county name with a parcel number (or enter a street address instead).")
     elif COUNTIES[county].get("kind") == "regrid" and pin and ("," in pin or " " in pin.strip()):
         cmd += ["--address", pin]                      # Regrid: a street address works best
     else:
@@ -228,7 +234,7 @@ def photo_clear(path):
     return [], (_load(path) if path else None), "Corners cleared"
 
 
-def run_photo(path, work, county_label, pin, boundary, label, golden, pts, progress=gr.Progress()):
+def run_photo(path, work, county_label, pin, boundary, label, golden, pts, rstate="", rcounty="", progress=gr.Progress()):
     import drone_photo as D, listing_shot as ls, pipeline as P
     county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
@@ -244,6 +250,13 @@ def run_photo(path, work, county_label, pin, boundary, label, golden, pts, progr
         parcel["county"], parcel["city"], parcel["state"], parcel["zip"] = rg.get("county", ""), rg.get("city", ""), rg.get("state", ""), rg.get("zip", "")
         parcel["situs"] = label or rg.get("street", ""); parcel["use_desc"] = "land"
         cfg = {"name": "boundary file", "kind": "file", "scan": "federal", "fields": {}, "defaults": {}}
+    elif cfg.get("kind") == "realie":
+        st = (rstate or "").split(" ")[0].strip().upper(); cn = (rcounty or "").strip()
+        looks_addr = bool(re.match(r"^\s*\d+\s+[A-Za-z]", pin))
+        try:
+            parcel = P.fetch_parcel_realie(None if looks_addr else pin, st, cn, pin if looks_addr else None)
+        except SystemExit as e:
+            raise gr.Error(str(e))
     elif cfg.get("kind") == "regrid":
         parcel = ls.fetch_parcel(pin, None, pin if ("," in pin or " " in pin) else None, None, None)
     else:
@@ -343,7 +356,10 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                 with gr.Column(scale=1, min_width=320):
                     gr.Markdown("### Property")
                     county = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state")
-                    pin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
+                    pin = gr.Textbox(label="Parcel number (PIN / APN) — or a street address with the Realie option", placeholder="20-0-0636-002-00")
+                    with gr.Row(visible=False) as realie_row:
+                        rstate = gr.Dropdown([f"{k} — {v}" for k, v in S.STATES.items()], value="MO — Missouri", label="State (Realie)")
+                        rcounty = gr.Textbox(label="County (Realie)", placeholder="Cass")
                     gr.Markdown('<div class="help">Parcel number as shown on the county assessor site. …or locate by coordinates:</div>')
                     with gr.Row():
                         lat = gr.Number(label="Latitude", value=None); lon = gr.Number(label="Longitude", value=None)
@@ -363,8 +379,9 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     gallery = gr.Gallery(label="Packet", columns=3, height=640, object_fit="cover", show_label=False)
                     with gr.Accordion("Run log", open=False):
                         logbox = gr.Textbox(lines=14, show_label=False)
-            go.click(lambda c, p, la, lo, b, bl, a, l, lw, r: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", lw.split(" ")[0], r),
-                     [county, pin, lat, lon, boundary, blabel, angles, lights, lowv, render], [gallery, zipf, summary, logbox, run_dir])
+            go.click(lambda c, p, la, lo, b, bl, a, l, lw, r, rs, rc: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", lw.split(" ")[0], r, rs, rc),
+                     [county, pin, lat, lon, boundary, blabel, angles, lights, lowv, render, rstate, rcounty], [gallery, zipf, summary, logbox, run_dir])
+            county.change(lambda c: gr.update(visible=("Realie" in (c or ""))), [county], [realie_row])
 
         with gr.Tab("Real drone photo", id="photo"):
             with gr.Row():
@@ -373,7 +390,10 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     photo = gr.Image(type="filepath", label="Drone photo", height=360, sources=["upload"])
                     pstatus = gr.Markdown('<div class="help">Upload a photo straight from the drone (SD card) to keep its GPS and gimbal data. Otherwise click the parcel corners in order — 4 or more corners also enables callouts.</div>')
                     pcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state")
-                    ppin = gr.Textbox(label="Parcel number (PIN / APN)", placeholder="20-0-0636-002-00")
+                    ppin = gr.Textbox(label="Parcel number (PIN / APN) — or a street address with the Realie option", placeholder="20-0-0636-002-00")
+                    with gr.Row(visible=False) as prealie_row:
+                        prstate = gr.Dropdown([f"{k} — {v}" for k, v in S.STATES.items()], value="MO — Missouri", label="State (Realie)")
+                        prcounty = gr.Textbox(label="County (Realie)", placeholder="Cass")
                     with gr.Accordion("Or upload a boundary file (Land id export)", open=False):
                         pboundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
                         plabel = gr.Textbox(label="Address or name for the card")
@@ -389,7 +409,8 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo])
             photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
             pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
-            pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pboundary, plabel, pgolden, pts_state], [pgallery, pnote, run_dir, pzip])
+            pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pboundary, plabel, pgolden, pts_state, prstate, prcounty], [pgallery, pnote, run_dir, pzip])
+            pcounty.change(lambda c: gr.update(visible=("Realie" in (c or ""))), [pcounty], [prealie_row])
 
         with gr.Tab("Review & edit", id="edit"):
             gr.Markdown('<div class="help">Edit the flagship image once — every other view is redrawn from the same edits. Drag corners, callouts or the acreage card; double-click a callout to rename it; <b>Delete</b> removes the selected item. Add corners, callouts (black) or road pins (white) with the buttons, then <b>Apply</b>.</div>')

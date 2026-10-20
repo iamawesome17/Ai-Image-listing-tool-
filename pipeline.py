@@ -155,6 +155,49 @@ def fetch_parcel_camavision(cfg, pin=None, lat=None, lon=None):
     return parcel
 
 
+def fetch_parcel_realie(pin=None, state=None, county=None, address=None, lat=None, lon=None):
+    """Realie.ai nationwide property API (free tier): parcel by APN + state + county, or by street address + state."""
+    key = os.environ.get("REALIE_TOKEN", "").strip()
+    if not key: sys.exit("REALIE_TOKEN is not set (Railway → Variables).")
+    hdr = {"Authorization": key}
+    if pin and state and county:
+        q = {"parcelId": pin.strip(), "state": state.upper(), "county": county}
+        d = ls.http_json("https://app.realie.ai/api/public/property/parcelId/?" + urllib.parse.urlencode(q), headers=hdr, timeout=40)
+        log("parcel", "Realie parcelId lookup", **{k: q[k] for k in ("parcelId", "state", "county")})
+        props = [d["property"]] if d.get("property") else []
+        if not props:                                          # try the digits-only form; Realie matches the county's own format
+            alt = re.sub(r"[^0-9A-Za-z]", "", pin)
+            if alt != pin.strip():
+                d = ls.http_json("https://app.realie.ai/api/public/property/parcelId/?" + urllib.parse.urlencode({**q, "parcelId": alt}), headers=hdr, timeout=40)
+                props = [d["property"]] if d.get("property") else []
+    elif address and state:
+        q = {"state": state.upper(), "address": address, "limit": 3}
+        if county: q["county"] = county
+        d = ls.http_json("https://app.realie.ai/api/public/property/search/?" + urllib.parse.urlencode(q), headers=hdr, timeout=40)
+        log("parcel", "Realie address search", address=address, state=state)
+        props = [x for x in d.get("properties", []) if x.get("geometry")]
+    else:
+        sys.exit("Realie needs a parcel number with state + county, or a street address with state.")
+    if not props: sys.exit(f"Realie found no parcel for that input in {county or ''} {state or ''}.".replace("  ", " "))
+    pr = props[0]; geom = pr.get("geometry")
+    if not geom: sys.exit("Realie has this parcel but no boundary polygon for it — use the county source or a Land id KML.")
+    from shapely import force_2d
+    poly = force_2d(shape(geom))
+    if poly.geom_type == "MultiPolygon": poly = max(poly.geoms, key=lambda g: g.area)
+    loc = pr.get("propertyLocation", {}); ident = pr.get("propertyIdentification", {}); own = ident.get("currentOwner", {})
+    acres = (pr.get("landInformation") or {}).get("acres") or pr.get("acres")
+    norm = {"PIN": pr.get("parcelId") or ident.get("parcelId"), "SiteAddress": loc.get("address") or pr.get("address"), "Acres": acres,
+            "OwnerName": " & ".join(x for x in [own.get("ownerName"), own.get("ownerName2")] if x), "UseCode": str(pr.get("useCode") or ""),
+            "LegalDesc": (pr.get("legalInformation") or {}).get("legalDescription"), "county": (loc.get("countyUSPS") or ident.get("county") or county or "").title(),
+            "city": loc.get("city") or ident.get("city"), "zip": loc.get("zipCode") or pr.get("zipCode")}
+    parcel = ls.parcel_from_feature({"geometry": poly.__geo_interface__, "properties": norm}, {"state": (loc.get("state") or state or "").upper()})
+    cl = pr.get("propertyClassification") or {}
+    parcel["use_desc"] = (cl.get("countyLandUseCode") or "").strip(" (").lower() or "land"
+    parcel["feature"] = {"type": "Feature", "geometry": poly.__geo_interface__, "properties": {k: v for k, v in pr.items() if k not in ("geometry", "location")}}
+    parcel["raw"] = {"LegalDesc": norm["LegalDesc"], "source": "realie", "realieParcelId": pr.get("realieParcelId")}
+    return parcel
+
+
 def fetch_parcel_county(cfg, pin=None, lat=None, lon=None):
     """Parcel from a county or statewide ArcGIS parcel layer, normalized to the pipeline's parcel dict."""
     if cfg.get("kind") == "camavision":
@@ -717,6 +760,7 @@ def main():
     ap.add_argument("--county"); ap.add_argument("--pin"); ap.add_argument("--lat", type=float); ap.add_argument("--lon", type=float)
     ap.add_argument("--boundary", help="KML/KMZ/GeoJSON/zipped Shapefile of the parcel (e.g. Land id export)"); ap.add_argument("--label", help="address/name for the card")
     ap.add_argument("--regrid", action="store_true"); ap.add_argument("--apn"); ap.add_argument("--path"); ap.add_argument("--address")
+    ap.add_argument("--state", help="two-letter state (Realie)"); ap.add_argument("--county-name", help="county name (Realie)")
     ap.add_argument("--angles", default="S,E,W,N"); ap.add_argument("--lights", default="golden,day")
     ap.add_argument("--low", default="auto", help="low horizon views: 'auto' = road side + opposite, 'none', or e.g. S,N")
     ap.add_argument("--model", default="grok"); ap.add_argument("--res", default="2k", choices=["1k", "2k"]); ap.add_argument("--no-render", action="store_true"); ap.add_argument("--force", action="store_true")
@@ -743,6 +787,9 @@ def main():
         parcel["situs"] = a.label or rg.get("street", ""); parcel["use_desc"] = "land"
         cfg = {"name": "boundary file", "kind": "file", "scan": "federal", "fields": {}, "defaults": {}}
         log("parcel", "boundary file", file=a.boundary, acres=parcel["acres"])
+    elif cfg is not None and cfg.get("kind") == "realie":
+        parcel = fetch_parcel_realie(a.pin, a.state, a.county_name, a.address, a.lat, a.lon)
+        log("parcel", "Realie", apn=parcel["apn"], county=parcel["county"])
     elif a.regrid or cfg is None or cfg.get("kind") == "regrid":
         parcel = ls.fetch_parcel(a.pin or a.apn, a.path, a.address, a.lat, a.lon); cfg = sources["regrid"]
         c0 = parcel["polygon"].centroid; rg = reverse_geocode(c0.y, c0.x)

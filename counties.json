@@ -247,6 +247,13 @@
     "reverse_geocode": true,
     "_note": "Vanguard CAMAvision map (WFS). 'parcels' has attributes + envelope only; polygons come from the 'search' layer matched by envelope. Parcel ids look like 120419000000003001 (short_pid 3.001)."
   },
+  "realie": {
+    "name": "Any US county (Realie)",
+    "kind": "realie",
+    "scan": "federal",
+    "defaults": {},
+    "_note": "Realie.ai property API (REALIE_TOKEN). Parcel by APN + state + county, or street address + state. Returns polygon, acres, situs, owner, use, legal."
+  },
   "regrid": {
     "name": "Any county (Regrid \u2014 needs a Regrid API plan)",
     "kind": "regrid",
