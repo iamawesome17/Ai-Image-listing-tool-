@@ -72,14 +72,29 @@ def draw_points(path, pts):
     return im
 
 
+WORK_W = 1600   # display / click / output width; the original stays untouched for metadata
+
+
+def make_work_copy(path):
+    """Downscale the uploaded photo to WORK_W wide for fast display and clicking; returns the new path."""
+    im = _load(path)
+    if im.width > WORK_W:
+        im = im.resize((WORK_W, round(im.height * WORK_W / im.width)), Image.LANCZOS)
+    out = Path(path).with_name(Path(path).stem + "_work.jpg"); im.save(out, quality=92)
+    return str(out)
+
+
 def photo_uploaded(path):
     import drone_photo as D
-    meta = D.read_metadata(path) if path else None
+    if not path: return None, None, [], "", None
+    meta = D.read_metadata(path)
+    work = make_work_copy(path)
     if meta:
         msg = f"✅ Drone metadata found ({meta['model'] or 'camera'}, {meta['alt_m']:.0f} m up, heading {meta['yaw']:.0f}°, tilt {meta['pitch']:.0f}°) — the property line will be placed automatically. You can still click corners to override."
     else:
-        msg = "ℹ️ No drone metadata in this file — click the parcel corners on the photo, in order around the boundary."
-    return path, [], msg
+        tags = D.metadata_debug(path)
+        msg = "ℹ️ No usable drone metadata in this file — click the parcel corners on the photo, in order around the boundary." + (f"  (found: {tags})" if tags else "  (no EXIF/XMP at all — the file was probably re-saved by a photo app)")
+    return path, work, [], msg, work
 
 
 def photo_click(path, pts, evt: gr.SelectData):
@@ -91,7 +106,7 @@ def photo_clear(path):
     return [], (_load(path) if path else None), "Corners cleared"
 
 
-def run_photo(path, county_label, pin, golden, pts, progress=gr.Progress()):
+def run_photo(path, work, county_label, pin, golden, pts, progress=gr.Progress()):
     import drone_photo as D, listing_shot as ls, pipeline as P
     county = next(k for k, v in COUNTY_LABELS.items() if v == county_label)
     pin = (pin or "").strip()
@@ -110,7 +125,7 @@ def run_photo(path, county_label, pin, golden, pts, progress=gr.Progress()):
     points = [tuple(p) for p in pts] if pts and len(pts) >= 3 else None
     progress(0.4, desc="Golden-hour relight (≈1 min)…" if golden else "Drawing lines…")
     try:
-        r = D.annotate(path, parcel, scan, points, golden, out_dir=HERE / "out" / parcel["apn"] / "photos")
+        r = D.annotate(work or path, parcel, scan, points, golden, out_dir=HERE / "out" / parcel["apn"] / "photos", meta_path=path)
     except RuntimeError as e:
         raise gr.Error(str(e))
     note = f"Property line from **{r['source']}**."
@@ -140,7 +155,7 @@ footer {display:none !important;}
 .gallery-item img {object-fit: cover;}
 """
 
-with gr.Blocks(title="Bana Listing Photos", theme=THEME, css=CSS) as demo:
+with gr.Blocks(title="Bana Listing Photos") as demo:
     gr.HTML('<div id="hero"><h1>Bana Listing Photos</h1><p>Parcel number in → listing-ready images out: true property lines on satellite and AI drone views, or on your own drone photos.</p></div>')
 
     with gr.Tab("Generate from parcel"):
@@ -180,13 +195,13 @@ with gr.Blocks(title="Bana Listing Photos", theme=THEME, css=CSS) as demo:
                 pnote = gr.Markdown()
             with gr.Column(scale=2):
                 pgallery = gr.Gallery(label="Results", columns=2, height=640, object_fit="contain", show_label=False)
-        pts_state = gr.State([]); orig_state = gr.State(None)
-        photo.upload(photo_uploaded, [photo], [orig_state, pts_state, pstatus])
-        photo.select(photo_click, [orig_state, pts_state], [pts_state, photo, pstatus])
-        pclear.click(photo_clear, [orig_state], [pts_state, photo, pstatus])
-        pgo.click(run_photo, [orig_state, pcounty, ppin, pgolden, pts_state], [pgallery, pnote])
+        pts_state = gr.State([]); orig_state = gr.State(None); work_state = gr.State(None)
+        photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo])
+        photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
+        pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
+        pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pgolden, pts_state], [pgallery, pnote])
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=2)
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)),
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)), theme=THEME, css=CSS,
                 auth=(("bana", PASSWORD) if PASSWORD else None))

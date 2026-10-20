@@ -101,9 +101,21 @@ def relight_golden(img, pts, ref_url=None):
 
 
 # ---------- main ----------
-def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref_url=None):
+def metadata_debug(path):
+    """Which drone/EXIF tags exist in the file (for the UI message when parsing fails)."""
+    raw = Path(path).read_bytes()[:4_000_000].decode("latin-1", errors="ignore")
+    found = sorted(set(re.findall(r'drone-dji:([A-Za-z]+)', raw)))[:12]
+    try:
+        exif = Image.open(path).getexif(); model = exif.get(272); gps = 0x8825 in exif
+    except Exception:
+        model, gps = None, False
+    bits = ([f"camera {model}"] if model else []) + (["EXIF GPS"] if gps else []) + ([f"DJI tags: {', '.join(found)}"] if found else [])
+    return "; ".join(bits)
+
+
+def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref_url=None, meta_path=None):
     img = ImageOps.exif_transpose(Image.open(photo_path)).convert("RGBA")
-    meta = read_metadata(photo_path)
+    meta = read_metadata(meta_path or photo_path)
     source = "manual points"
     if pts is None and meta:
         pts = project_polygon(meta, parcel["polygon"], img.width, img.height); source = "DJI metadata projection"

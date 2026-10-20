@@ -2,4 +2,4 @@ pillow
 shapely
 numpy
 opencv-python-headless
-gradio
+gradio==6.30.0
