@@ -31,10 +31,10 @@ def start_draw(name, parent=None, lat=None, lon=None, out_root=None):
     frame = ls.Frame(c.y, c.x, z, 640, 480)
     sat = ls.fetch_satellite(frame); sat.convert("RGB").save(out / "p1_cover_clean.png")
     fm = L.FrameMap(frame)
-    if parent is not None:
+    if parent is not None:                                       # start small inside the parent: a 4-corner box ~1/4 of the parent's bbox, at its centroid
         ring = [(x, y) for x, y, *_ in poly.exterior.coords][:-1]
-        from drone_photo import simplify_to_n
-        start = simplify_to_n(ring, 16) if len(ring) > 16 else ring
+        minx, miny, maxx, maxy = poly.bounds; w, h = (maxx - minx) * 0.25, (maxy - miny) * 0.25
+        start = [(c.x - w / 2, c.y - h / 2), (c.x + w / 2, c.y - h / 2), (c.x + w / 2, c.y + h / 2), (c.x - w / 2, c.y + h / 2)]
         reference = [[x, y] for x, y in ring]
     else:   # starter rectangle ~ 40% of the frame
         W, H = frame.W, frame.H
@@ -57,6 +57,21 @@ def start_draw(name, parent=None, lat=None, lon=None, out_root=None):
     P.save_state(out, parcel, maps)
     P.finalize(out)
     return out
+
+
+def rezoom(run_dir, delta):
+    """Re-fetch the satellite around the current boundary at zoom ± delta (draw runs only)."""
+    out = Path(run_dir); parcel, layout, maps, scan = P.load_state(out)
+    if not maps.get("_meta", {}).get("draw"): raise ValueError("Zoom only applies to a drawing session (Subdivision lot tab).")
+    fm = L.map_from_json(maps["p1_cover"]["map"]); fr = fm.frame
+    poly = Polygon(layout["boundary"]); c = poly.centroid
+    z = max(12, min(20, fr.z + delta))
+    frame = ls.Frame(c.y, c.x, z, 640, 480)
+    sat = ls.fetch_satellite(frame); sat.convert("RGB").save(out / "p1_cover_clean.png")
+    maps["p1_cover"]["map"] = L.FrameMap(frame).to_json()
+    (out / "maps.json").write_text(json.dumps(maps, indent=1))
+    P.finalize(out)
+    return z
 
 
 def save_lot(run_dir, name=None):

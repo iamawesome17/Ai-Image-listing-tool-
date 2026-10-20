@@ -31,7 +31,9 @@ window.banaEditor = (function () {
     if (ct) ct.value = st.card.title; if (cs) cs.value = st.card.sub; if (dc) dc.value = st.disclaimer || "";
     panel(); status("Loaded. Drag corners, labels or the card. Double-click a label to rename.");
   }
-  function fit() { const wrap = canvas.parentElement; const w = Math.min(wrap.clientWidth || 1000, 1152); scale = w / st.W; canvas.width = Math.round(st.W * scale); canvas.height = Math.round(st.H * scale); }
+  let lastW = 0;
+  function fit() { const wrap = canvas.parentElement; const w = Math.min(wrap.clientWidth || 1000, 1152); lastW = wrap.clientWidth; scale = w / st.W; canvas.width = Math.round(st.W * scale); canvas.height = Math.round(st.H * scale); }
+  setInterval(() => { if (st && img && canvas && canvas.parentElement && canvas.parentElement.clientWidth && canvas.parentElement.clientWidth !== lastW) { fit(); draw(); } }, 400);
   function S(v) { return v * scale; }
 
   function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }

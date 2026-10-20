@@ -181,7 +181,7 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, rende
         out_dir = sorted((HERE / "out").glob("*"), key=lambda p: p.stat().st_mtime)[-1]
     images, z = packet_outputs(out_dir)
     scan = json.loads((out_dir / "scan.json").read_text()).get("scene_description", "") if (out_dir / "scan.json").exists() else ""
-    summary = f"**{len(images)} images · {round(time.time()-t0)} s** — scroll down to **Review & edit** to fix any label or line before you ship.\n\n{scan}"
+    summary = f"**{len(images)} images · {round(time.time()-t0)} s** — next step: **Review & edit** to fix any label or line before you ship.\n\n{scan}"
     return images, z, summary, text[-4000:], str(out_dir)
 
 
@@ -304,7 +304,7 @@ def run_photo(path, work, source, county_label, pin, lot, boundary, label, acres
         raise gr.Error(str(e))
     note = f"Property line from **{r['source']}**."
     if r["source"] == "placed for dragging":
-        note = ("**Shape placed on the photo** — scroll down to **Review & edit**, drag the corners onto the real corners" +
+        note = ("**Shape placed on the photo** — open **Review & edit**, drag the corners onto the real corners" +
                 (" (4 are enough; the rest snap in and the callouts appear)" if not parcel.get("no_geo") else ", add corners if needed, set the card text") + ", then Apply.")
     if r.get("meta"):
         m = r["meta"]; note += f" Camera: {m['model'] or 'drone'}, {m['alt_m']:.0f} m up, heading {m['yaw']:.0f}°, tilt {m['pitch']:.0f}°."
@@ -324,7 +324,7 @@ def start_lot(name, county_label, pin, lat, lon, rstate, rcounty, progress=gr.Pr
         raise gr.Error("Enter the parent (mother) parcel number, or a latitude/longitude to open the map there.")
     progress(0.5, desc="Satellite…")
     out = lots.start_draw(name, parent, lat, lon, out_root=HERE / "out")
-    msg = ("**Parent lot shown dashed in yellow.** " if parent else "") + "Drag the white corners onto the lot lines below (+ Corner adds one, Delete removes the selected one). Acreage updates live. Then **Save lot**."
+    msg = ("**Parent lot shown dashed in yellow; a small starter box sits at its centre.** " if parent else "") + "On the Review & edit tab: drag the white corners onto the lot lines (+ Corner then click on a line adds one; Delete removes the selected one), Zoom in/out as needed. Acreage updates live. Then **Save lot** and come back here to generate."
     return msg, str(out)
 
 
@@ -339,6 +339,25 @@ def save_lot_btn(out_dir, key, edits_json):
     imgs, z = packet_outputs(out_dir)
     up = lambda: gr.update(choices=choices, value=str(f))
     return f"✅ Saved **{Path(f).stem}** — {acres:.2f} acres. It is in the saved-lot lists now (drone photo tab, and *Generate packet from this lot* here).", up(), up(), imgs
+
+
+def is_draw_run(out_dir):
+    try:
+        return gr.update(visible=bool(json.loads((Path(out_dir) / "maps.json").read_text()).get("_meta", {}).get("draw")))
+    except Exception:
+        return gr.update(visible=False)
+
+
+def zoom_lot(out_dir, key, edits_json, delta):
+    """Keep the current edits, then re-render the satellite closer/farther around the lot."""
+    import pipeline as P, lots
+    if not out_dir: raise gr.Error("Open a map first.")
+    try: edits = json.loads(edits_json) if edits_json else None
+    except Exception: edits = None
+    if edits: P.apply_edits(out_dir, key or "p1_cover", edits)
+    try: z = lots.rezoom(out_dir, delta)
+    except ValueError as e: raise gr.Error(str(e))
+    return f"Zoom {z}"
 
 
 def generate_from_lot(lot, render, angles, lights, lowv, progress=gr.Progress()):
@@ -428,8 +447,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                         llat = gr.Number(label="…or latitude", value=None); llon = gr.Number(label="longitude", value=None)
                     lopen = gr.Button("Open satellite & draw", variant="primary", size="lg")
                     lmsg = gr.Markdown()
-                    lsave = gr.Button("Save lot", size="lg")
-                    lsaved = gr.Markdown()
+                    gr.Markdown('<div class="help">Step 2 happens on the <b>Review &amp; edit</b> tab (opens automatically): drag the corners, Save lot. Step 3: come back here and generate.</div>')
                 with gr.Column(scale=2):
                     gr.Markdown("### Generate the packet from a saved lot")
                     with gr.Row():
@@ -441,6 +459,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                         llow = gr.Dropdown(["auto (road side + opposite)", "none", "S", "N", "E", "W"], value="auto (road side + opposite)", label="Low horizon views")
                     lgo = gr.Button("Generate packet from this lot", variant="primary", size="lg")
                     lsummary = gr.Markdown(); lzip = gr.File(label="Download packet (zip)")
+                    edit_btn1 = gr.Button("Open in Review & edit →", size="sm")
                     lgallery = gr.Gallery(label="Packet", columns=3, height=420, object_fit="cover", show_label=False)
                     with gr.Accordion("Run log", open=False):
                         llog = gr.Textbox(lines=10, show_label=False)
@@ -469,6 +488,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     go = gr.Button("Create packet", variant="primary", size="lg")
                     summary = gr.Markdown()
                     zipf = gr.File(label="Download packet (zip)")
+                    edit_btn2 = gr.Button("Open in Review & edit →", size="sm")
                 with gr.Column(scale=2):
                     gallery = gr.Gallery(label="Packet", columns=3, height=640, object_fit="cover", show_label=False)
                     with gr.Accordion("Run log", open=False):
@@ -504,6 +524,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     pclear = gr.Button("Clear clicked corners", size="sm")
                     pnote = gr.Markdown()
                     pzip = gr.File(label="Download (zip)")
+                    edit_btn3 = gr.Button("Open in Review & edit →", size="sm")
                 with gr.Column(scale=2):
                     pgallery = gr.Gallery(label="Results", columns=2, height=640, object_fit="contain", show_label=False)
             pts_state = gr.State([]); orig_state = gr.State(None); work_state = gr.State(None)
@@ -515,7 +536,32 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             psource.change(lambda v: (gr.update(visible=v.startswith("Parcel")), gr.update(visible=v.startswith("Saved")), gr.update(visible=v.startswith("Draw"))), [psource], [pg_parcel, pg_lot, pg_draw])
             plrefresh.click(lambda: gr.update(choices=lots.list_lots()), None, [plot])
 
-        # ---------- 4. counties ----------
+        # ---------- 4. review & edit ----------
+        with gr.Tab("Review & edit", id="edit"):
+            gr.Markdown('<div class="help">Separate step after an asset is created. Pick the run and the image; drag corners, callouts or the acreage card; double-click a callout to rename it; <b>Delete</b> removes the selected item; <b>+ Corner</b> then click on the line adds one. <b>Apply</b> redraws every image in the packet from the same edits.</div>')
+            with gr.Row():
+                eruns = gr.Dropdown(choices=list_runs(), label="Run (newest first)", scale=3)
+                erefresh = gr.Button("↻", scale=0, min_width=48)
+            with gr.Row():
+                ekey = gr.Dropdown(choices=[], label="Image to edit", scale=3)
+                eload = gr.Button("Load", scale=1); eapply = gr.Button("Apply edits & rebuild packet", variant="primary", scale=2); ereset = gr.Button("Reset to automatic", scale=1)
+            with gr.Row(visible=False) as lot_tools:
+                lzin = gr.Button("Zoom in", size="sm"); lzout = gr.Button("Zoom out", size="sm"); lsave = gr.Button("Save lot", variant="primary", size="sm"); lzmsg = gr.Markdown()
+            lsaved = gr.Markdown()
+            gr.HTML(EDITOR_HTML)
+            epayload = gr.Textbox(visible=False); eedits = gr.Textbox(visible=False)
+            esummary = gr.Markdown()
+            with gr.Row():
+                egallery = gr.Gallery(label="Rebuilt packet", columns=4, height=420, object_fit="cover", show_label=False, scale=3)
+                ezip = gr.File(label="Download packet (zip)", scale=1)
+            eload.click(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+            ekey.input(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+            eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js=EXPORT_JS).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+            ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
+            erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
+            eruns.input(pick_run, [eruns], [ekey, run_dir]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS).then(is_draw_run, [run_dir], [lot_tools])
+
+        # ---------- 5. counties ----------
         with gr.Tab("Counties", id="counties"):
             gr.Markdown('<div class="help">Statewide sources cover every parcel in that state; <b>Any US county (Realie)</b> covers the rest. For a county you want on its own GIS: give the state and county, and either leave the URL blank (the app searches arcgis.com for the public parcel layer) or paste the parcel layer REST URL (…/MapServer/&lt;n&gt; or …/FeatureServer/&lt;n&gt;) or a CAMAvision map link (maps.camavision.com/…). Checked live before saving.</div>')
             with gr.Row():
@@ -527,37 +573,20 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             ctable = gr.Markdown(sources_markdown())
             cadd.click(lambda st, nm, u: add_county(st.split(" ")[0], nm, u), [cstate, cname, curl], [cmsg, ctable, county, pcounty, lcounty])
 
-    # ---------- editor (shared, below the tabs) ----------
-    with gr.Group():
-        gr.Markdown("## Review & edit\n<div class=\"help\">Loads automatically after a run. Drag corners, callouts or the acreage card; double-click a callout to rename it; <b>Delete</b> removes the selected item; <b>+ Corner</b> then click on the line adds one. Every image in the packet is redrawn from the same edits.</div>")
-        with gr.Row():
-            eruns = gr.Dropdown(choices=list_runs(), label="Run (newest first)", scale=3)
-            erefresh = gr.Button("↻", scale=0, min_width=48)
-        with gr.Row():
-            ekey = gr.Dropdown(choices=[], label="Image to edit", scale=3)
-            eload = gr.Button("Load", scale=1); eapply = gr.Button("Apply edits & rebuild packet", variant="primary", scale=2); ereset = gr.Button("Reset to automatic", scale=1)
-        gr.HTML(EDITOR_HTML)
-        epayload = gr.Textbox(visible=False); eedits = gr.Textbox(visible=False)
-        esummary = gr.Markdown()
-        with gr.Row():
-            egallery = gr.Gallery(label="Rebuilt packet", columns=4, height=420, object_fit="cover", show_label=False, scale=3)
-            ezip = gr.File(label="Download packet (zip)", scale=1)
-        eload.click(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-        ekey.input(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-        eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js=EXPORT_JS).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-        ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
-        erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
-        eruns.input(pick_run, [eruns], [ekey, run_dir]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-
     def after_run(out_dir):
         items = editable_images(out_dir) if out_dir else []
         return gr.update(choices=list_runs(), value=out_dir), gr.update(choices=items, value=items[0][1] if items else None)
-    load_chain = lambda evt: evt.then(after_run, [run_dir], [eruns, ekey]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+    load_chain = lambda evt: evt.then(after_run, [run_dir], [eruns, ekey])
+    goto_edit = lambda evt: evt.then(lambda: gr.Tabs(selected="edit"), None, [tabs]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS).then(is_draw_run, [run_dir], [lot_tools])
     load_chain(run_evt); load_chain(photo_evt)
-    # subdivision lot wiring (needs the editor components)
-    load_chain(lopen.click(start_lot, [lname, lcounty, lpin, llat, llon, lrstate, lrcounty], [lmsg, run_dir]))
+    for b in (edit_btn1, edit_btn2, edit_btn3):
+        goto_edit(b.click(lambda: None, None, None))
+    # subdivision lot wiring: drawing happens on the Review & edit tab, so open it right away
+    goto_edit(load_chain(lopen.click(start_lot, [lname, lcounty, lpin, llat, llon, lrstate, lrcounty], [lmsg, run_dir])))
     lsave.click(save_lot_btn, [run_dir, ekey, eedits], [lsaved, llot, plot, egallery], js=EXPORT_JS).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
     lrefresh.click(lambda: gr.update(choices=lots.list_lots()), None, [llot])
+    for btn, d in ((lzin, 1), (lzout, -1)):
+        btn.click(lambda o, k, e, d=d: zoom_lot(o, k, e, d), [run_dir, ekey, eedits], [lzmsg], js=EXPORT_JS).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
     lot_evt = lgo.click(generate_from_lot, [llot, lrender, langles, llights, llow], [lgallery, lzip, lsummary, llog, run_dir])
     load_chain(lot_evt)
 
