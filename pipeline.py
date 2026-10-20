@@ -1003,8 +1003,8 @@ def prepare(out, key, rec, layout, variant="", out_size=(1152, 864)):
     if not pts: return None, None, None
     if rec["kind"] == "photo":
         return img, base, [tuple(p) for p in pts]
-    margin = {"": 0.40 if rec["view"] != "nadir" else 0.25, "close": 0.10}[variant]
-    left, top, w, h = crop_box(img, pts, margin, keep_horizon=rec.get("low") and variant == "")
+    margin = {"": 0.40 if rec["view"] != "nadir" else 0.25, "close": 0.12 if rec.get("low") else 0.10}[variant]
+    left, top, w, h = crop_box(img, pts, margin, keep_horizon=bool(rec.get("low")))
     crop = img.crop((left, top, left + w, top + h)).resize(out_size, Image.LANCZOS)
     sx, sy = out_size[0] / w, out_size[1] / h
     bpx = [((x - left) * sx, (y - top) * sy) for x, y in pts]
@@ -1099,7 +1099,6 @@ def finalize(out):
             if g is not None: g.convert("RGB").save(out / f"{key}_with_lines.jpg", quality=94); files[key] = out / f"{key}_with_lines.jpg"
             continue
         for variant in ("", "close"):
-            if variant == "close" and rec.get("low"): continue
             g = draw_one(out, key, rec, parcel, layout, scan, variant)
             if g is None: continue
             name = f"{key}{'_' + variant if variant else ''}_outline.jpg"
@@ -1119,13 +1118,15 @@ def finalize(out):
     lab = lambda v: f"drone_from_{v}"
     add("photo_golden", "drone_photo_golden_hour_with_lines"); add("photo_original", "drone_photo_with_lines")
     add(f"{model}_nadir_golden", "overhead_golden_hour_with_lines")
+    for v in low: add(f"{model}_{v}_low_golden:close", f"close_low_view_from_{v}_golden_hour_with_lines")
+    for v in angles[:2]: add(f"{model}_{v}_golden:close", f"closeup_from_{v}_golden_hour_with_lines")
     for v in low: add(f"{model}_{v}_low_golden", f"low_view_from_{v}_golden_hour_with_lines")
     for v in angles: add(f"{model}_{v}_golden", f"{lab(v)}_golden_hour_with_lines")
-    for v in angles[:3]: add(f"{model}_{v}_golden:close", f"closeup_from_{v}_golden_hour_with_lines")
+    for v in angles[2:]: add(f"{model}_{v}_golden:close", f"closeup_from_{v}_golden_hour_with_lines")
     add("p1_cover", "satellite_cover_with_lines")
     add("plat", "plat_map")
     add(f"{model}_nadir_day", "overhead_day_with_lines")
-    for v in low: add(f"{model}_{v}_low_day", f"low_view_from_{v}_day_with_lines")
+    for v in low: add(f"{model}_{v}_low_day:close", f"close_low_view_from_{v}_day_with_lines"); add(f"{model}_{v}_low_day", f"low_view_from_{v}_day_with_lines")
     for v in angles: add(f"{model}_{v}_day", f"{lab(v)}_day_with_lines")
     add("p1_wide", "satellite_neighborhood_context"); add("p1_tight", "satellite_closeup_with_lines")
     for k, rec in maps.items():

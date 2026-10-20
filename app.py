@@ -181,7 +181,7 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, rende
         out_dir = sorted((HERE / "out").glob("*"), key=lambda p: p.stat().st_mtime)[-1]
     images, z = packet_outputs(out_dir)
     scan = json.loads((out_dir / "scan.json").read_text()).get("scene_description", "") if (out_dir / "scan.json").exists() else ""
-    summary = f"**{len(images)} images · {round(time.time()-t0)} s** — review them, then use **Review & edit** to fix any label or line before you ship.\n\n{scan}"
+    summary = f"**{len(images)} images · {round(time.time()-t0)} s** — scroll down to **Review & edit** to fix any label or line before you ship.\n\n{scan}"
     return images, z, summary, text[-4000:], str(out_dir)
 
 
@@ -285,7 +285,7 @@ def run_photo(path, work, county_label, pin, boundary, label, golden, pts, rstat
         m = r["meta"]; note += f" Camera: {m['model'] or 'drone'}, {m['alt_m']:.0f} m up, heading {m['yaw']:.0f}°, tilt {m['pitch']:.0f}°."
     note += (" Callouts placed from the ground fit." if r.get("ground_map") else " No ground fit (corners only) — boundary and card drawn, no callouts.")
     if scan_err: note += f" ⚠️ Surroundings scan failed ({scan_err}) — no automatic callouts."
-    note += " Check the line against what you know of the property, then use **Review & edit** to adjust."
+    note += " Scroll down to **Review & edit** — the photo is loaded there; drag the corners/labels and Apply."
     return [(f, Path(f).stem.replace("_", " ")) for f in r["files"]], note, r["out_dir"], r.get("zip")
 
 
@@ -374,12 +374,11 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     go = gr.Button("Create packet", variant="primary", size="lg")
                     summary = gr.Markdown()
                     zipf = gr.File(label="Download packet (zip)")
-                    edit_btn = gr.Button("Review & edit this packet →", size="sm")
                 with gr.Column(scale=2):
                     gallery = gr.Gallery(label="Packet", columns=3, height=640, object_fit="cover", show_label=False)
                     with gr.Accordion("Run log", open=False):
                         logbox = gr.Textbox(lines=14, show_label=False)
-            go.click(lambda c, p, la, lo, b, bl, a, l, lw, r, rs, rc: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", lw.split(" ")[0], r, rs, rc),
+            run_evt = go.click(lambda c, p, la, lo, b, bl, a, l, lw, r, rs, rc: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", lw.split(" ")[0], r, rs, rc),
                      [county, pin, lat, lon, boundary, blabel, angles, lights, lowv, render, rstate, rcounty], [gallery, zipf, summary, logbox, run_dir])
             county.change(lambda c: gr.update(visible=("Realie" in (c or ""))), [county], [realie_row])
 
@@ -388,7 +387,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                 with gr.Column(scale=1, min_width=320):
                     gr.Markdown("### Photo + property")
                     photo = gr.Image(type="filepath", label="Drone photo", height=360, sources=["upload"])
-                    pstatus = gr.Markdown('<div class="help">Upload a photo straight from the drone (SD card) to keep its GPS and gimbal data. Otherwise click the parcel corners in order — 4 or more corners also enables callouts.</div>')
+                    pstatus = gr.Markdown('<div class="help">Upload the photo straight from the drone SD card to keep its GPS and gimbal data (the line is then placed automatically). Otherwise just press <b>Annotate</b>: the parcel shape appears on the photo and you drag its corners into place in <b>Review &amp; edit</b> below — 4 corners are enough, the rest snap in. (Clicking corners on the photo first also works.)</div>')
                     pcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state")
                     ppin = gr.Textbox(label="Parcel number (PIN / APN) — or a street address with the Realie option", placeholder="20-0-0636-002-00")
                     with gr.Row(visible=False) as prealie_row:
@@ -402,36 +401,15 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     pgo = gr.Button("Annotate photo", variant="primary", size="lg")
                     pnote = gr.Markdown()
                     pzip = gr.File(label="Download (zip)")
-                    pedit_btn = gr.Button("Review & edit these photos →", size="sm")
                 with gr.Column(scale=2):
                     pgallery = gr.Gallery(label="Results", columns=2, height=640, object_fit="contain", show_label=False)
             pts_state = gr.State([]); orig_state = gr.State(None); work_state = gr.State(None)
             photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo])
             photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
             pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
-            pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pboundary, plabel, pgolden, pts_state, prstate, prcounty], [pgallery, pnote, run_dir, pzip])
+            photo_evt = pgo.click(run_photo, [orig_state, work_state, pcounty, ppin, pboundary, plabel, pgolden, pts_state, prstate, prcounty], [pgallery, pnote, run_dir, pzip])
             pcounty.change(lambda c: gr.update(visible=("Realie" in (c or ""))), [pcounty], [prealie_row])
 
-        with gr.Tab("Review & edit", id="edit"):
-            gr.Markdown('<div class="help">Edit the flagship image once — every other view is redrawn from the same edits. Drag corners, callouts or the acreage card; double-click a callout to rename it; <b>Delete</b> removes the selected item. Add corners, callouts (black) or road pins (white) with the buttons, then <b>Apply</b>.</div>')
-            with gr.Row():
-                eruns = gr.Dropdown(choices=list_runs(), label="Run (newest first)", scale=3)
-                erefresh = gr.Button("↻", scale=0, min_width=48)
-            with gr.Row():
-                ekey = gr.Dropdown(choices=[], label="Image to edit", scale=3)
-                eload = gr.Button("Load", scale=1); eapply = gr.Button("Apply edits & rebuild packet", variant="primary", scale=2); ereset = gr.Button("Reset to automatic", scale=1)
-            gr.HTML(EDITOR_HTML)
-            epayload = gr.Textbox(visible=False); eedits = gr.Textbox(visible=False)
-            esummary = gr.Markdown()
-            with gr.Row():
-                egallery = gr.Gallery(label="Rebuilt packet", columns=4, height=420, object_fit="cover", show_label=False, scale=3)
-                ezip = gr.File(label="Download packet (zip)", scale=1)
-            eload.click(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-            ekey.change(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-            eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js="(o, k, e) => [o, k, JSON.stringify(window.banaEditor.export())]").then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-            ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
-            erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
-            eruns.change(pick_run, [eruns], [ekey, run_dir])
         with gr.Tab("Counties", id="counties"):
             gr.Markdown('<div class="help">Statewide sources cover every parcel in that state. For a county that is not listed, add it here: give the state and county, and either leave the URL blank (the app searches arcgis.com for the county\'s public parcel layer) or paste the parcel layer\'s REST URL from the county GIS site (…/MapServer/&lt;n&gt; or …/FeatureServer/&lt;n&gt;), or a CAMAvision map link (maps.camavision.com/…) — the pattern many Missouri and Iowa counties use. The county is checked live before it is saved.</div>')
             with gr.Row():
@@ -442,8 +420,35 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             cmsg = gr.Markdown()
             ctable = gr.Markdown(sources_markdown())
             cadd.click(lambda st, nm, u: add_county(st.split(" ")[0], nm, u), [cstate, cname, curl], [cmsg, ctable, county, pcounty])
-        edit_btn.click(open_editor, [run_dir], [ekey, tabs])
-        pedit_btn.click(open_editor, [run_dir], [ekey, tabs])
+
+    with gr.Group():
+        gr.Markdown("## Review & edit\n<div class=\"help\">Loads automatically after a run. Edit one image — every image in the packet is redrawn from the same edits.</div>")
+        gr.Markdown('<div class="help">Edit the flagship image once — every other view is redrawn from the same edits. Drag corners, callouts or the acreage card; double-click a callout to rename it; <b>Delete</b> removes the selected item. Add corners, callouts (black) or road pins (white) with the buttons, then <b>Apply</b>.</div>')
+        with gr.Row():
+            eruns = gr.Dropdown(choices=list_runs(), label="Run (newest first)", scale=3)
+            erefresh = gr.Button("↻", scale=0, min_width=48)
+        with gr.Row():
+            ekey = gr.Dropdown(choices=[], label="Image to edit", scale=3)
+            eload = gr.Button("Load", scale=1); eapply = gr.Button("Apply edits & rebuild packet", variant="primary", scale=2); ereset = gr.Button("Reset to automatic", scale=1)
+        gr.HTML(EDITOR_HTML)
+        epayload = gr.Textbox(visible=False); eedits = gr.Textbox(visible=False)
+        esummary = gr.Markdown()
+        with gr.Row():
+            egallery = gr.Gallery(label="Rebuilt packet", columns=4, height=420, object_fit="cover", show_label=False, scale=3)
+            ezip = gr.File(label="Download packet (zip)", scale=1)
+        eload.click(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+        ekey.input(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+        eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js="(o, k, e) => [o, k, JSON.stringify(window.banaEditor.export())]").then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+        ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
+        erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
+        eruns.input(pick_run, [eruns], [ekey, run_dir])
+
+    # auto-load the editor after a run (ekey.change then loads the image into the canvas)
+    def after_run(out_dir):
+        items = editable_images(out_dir) if out_dir else []
+        return gr.update(choices=list_runs(), value=out_dir), gr.update(choices=items, value=items[0][1] if items else None)
+    run_evt.then(after_run, [run_dir], [eruns, ekey]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+    photo_evt.then(after_run, [run_dir], [eruns, ekey]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=2)

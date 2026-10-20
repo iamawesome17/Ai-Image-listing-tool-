@@ -68,10 +68,11 @@ window.banaEditor = (function () {
     ctx.font = `bold ${S(20)}px Poppins, sans-serif`; ctx.textAlign = "right"; ctx.fillStyle = "#fff"; ctx.shadowColor = "#000"; ctx.shadowBlur = 4; ctx.fillText(st.disclaimer || "", canvas.width - S(28), canvas.height - S(44)); ctx.shadowBlur = 0;
   }
 
-  function pos(e) { const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale }; }
+  function pos(e) { const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) * (st.W / r.width), y: (e.clientY - r.top) * (st.H / r.height) }; }
   function hit(p) {
-    for (let i = 0; i < st.boundary.length; i++) { const v = st.boundary[i]; if (Math.hypot(v[0] - p.x, v[1] - p.y) < 12 / scale) return { t: "v", i }; }
-    for (let i = st.labels.length - 1; i >= 0; i--) { const l = st.labels[i]; const b = labelBox(l); const sx = S(p.x), sy = S(p.y); if ((sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h) || Math.hypot(l.x - p.x, l.y - p.y) < 14 / scale) return { t: "l", i }; }
+    const cs = canvas.getBoundingClientRect().width / st.W;                      // on-screen px per image px
+    for (let i = 0; i < st.boundary.length; i++) { const v = st.boundary[i]; if (Math.hypot(v[0] - p.x, v[1] - p.y) < 14 / cs) return { t: "v", i }; }
+    for (let i = st.labels.length - 1; i >= 0; i--) { const l = st.labels[i]; const b = labelBox(l); const sx = S(p.x), sy = S(p.y); if ((sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h) || Math.hypot(l.x - p.x, l.y - p.y) < 16 / cs) return { t: "l", i }; }
     const cb = cardBox(); const sx = S(p.x), sy = S(p.y); if (sx >= cb.x && sx <= cb.x + cb.w && sy >= cb.y && sy <= cb.y + cb.h) return { t: "card" };
     return null;
   }
@@ -81,7 +82,7 @@ window.banaEditor = (function () {
 
   function onDown(e) {
     if (!st) return; const p = pos(e);
-    if (mode === "corner") { const ne = nearestEdge(p); if (ne && ne.d < 40 / scale) { snap(); st.boundary.splice(ne.i + 1, 0, [ne.x, ne.y]); st.boundary_edited = true; sel = { t: "v", i: ne.i + 1 }; draw(); } return; }
+    if (mode === "corner") { const ne = nearestEdge(p); if (ne && ne.d < 40 / (canvas.getBoundingClientRect().width / st.W)) { snap(); st.boundary.splice(ne.i + 1, 0, [ne.x, ne.y]); st.boundary_edited = true; sel = { t: "v", i: ne.i + 1 }; draw(); } return; }
     sel = hit(p); panel();
     if (sel) { snap(); drag = { p, start: JSON.parse(JSON.stringify(sel.t === "v" ? st.boundary[sel.i] : sel.t === "l" ? [st.labels[sel.i].x, st.labels[sel.i].y] : [st.card.x, st.card.y])) }; }
     draw();
@@ -105,5 +106,6 @@ window.banaEditor = (function () {
     else box.style.display = "none";
   }
   function exportLayout() { if (!st) return null; return { boundary: st.boundary, boundary_edited: st.boundary_edited, card: st.card, labels: st.labels, disclaimer: st.disclaimer }; }
-  return { load, export: exportLayout, init };
+  function debug(clientX, clientY) { const p = pos({ clientX, clientY }); return { p, hit: hit(p), rect: canvas.getBoundingClientRect(), cw: canvas.width, W: st.W, scale, b0: st.boundary[0] }; }
+  return { load, export: exportLayout, init, debug };
 })();
