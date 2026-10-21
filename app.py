@@ -114,29 +114,50 @@ def editor_payload(out_dir, key):
     return json.dumps(pl) if pl else ""
 
 
-def apply_and_rebuild(out_dir, key, edits_json, progress=gr.Progress()):
-    import pipeline as P
-    if not out_dir or not key: raise gr.Error("Nothing to apply — open a run in the editor first.")
+def _edits(edits_json):
     try:
         edits = json.loads(edits_json) if edits_json else None
     except Exception:
         edits = None
     if not edits: raise gr.Error("The editor has nothing loaded yet — pick an image and click Load.")
-    progress(0.2, desc="Applying edits to every image…")
-    zp, n = P.apply_edits(out_dir, key, edits)
-    imgs, z = packet_outputs(out_dir)
-    return imgs, z, f"**Packet rebuilt: {n} images.** Edits applied to every view (lines, pin card, callouts)."
+    return edits
+
+
+def apply_and_rebuild(out_dir, key, edits_json, scope, progress=gr.Progress()):
+    """Apply the editor's edits: to every image (shared layout) or to this image only (its own override). No API calls, nothing is re-rendered."""
+    import pipeline as P
+    if not out_dir or not key: raise gr.Error("Nothing to apply — open a run in the editor first.")
+    edits = _edits(edits_json); one = str(scope).startswith("This")
+    progress(0.2, desc="Redrawing this image…" if one else "Redrawing every image…")
+    zp, n = P.apply_edits(out_dir, key, edits, scope="one" if one else "all")
+    imgs, z = packet_outputs(out_dir); f = P.output_file(out_dir, key)
+    msg = (f"**Saved for this image only** — the other {n - 1} images are unchanged. Download it on the right, or the whole packet." if one
+           else f"**Packet rebuilt: {n} images.** Edits applied to every view (images with their own edits keep them).")
+    return imgs, z, msg, (str(f) if f.exists() else None), (str(f) if f.exists() else None)
+
+
+def preview_one(out_dir, key, edits_json, progress=gr.Progress()):
+    """Render this image with the current edits without saving anything — exactly what Apply would produce."""
+    import pipeline as P
+    if not out_dir or not key: raise gr.Error("Open a run in the editor first.")
+    edits = _edits(edits_json)
+    progress(0.3, desc="Rendering preview…")
+    im = P.preview(out_dir, key, edits)
+    if im is None: raise gr.Error("This image cannot be drawn yet (no ground map).")
+    p = Path(out_dir) / "preview.jpg"; im.convert("RGB").save(p, quality=92)
+    return str(p)
 
 
 def reset_edits(out_dir):
     import pipeline as P
     if not out_dir: raise gr.Error("Nothing to reset.")
     out = Path(out_dir); parcel, layout, maps, scan = P.load_state(out)
-    import listing_shot as ls
     lay = P.L.build_layout(parcel, scan)
-    (out / "layout.json").write_text(json.dumps(lay, indent=1))
+    for k in ("boundary", "boundary_edited", "reference"):                # keep user-drawn geometry
+        if k in layout and (layout.get("boundary_edited") or k == "reference"): lay[k] = layout[k]
+    (out / "layout.json").write_text(json.dumps(lay, indent=1)); P.save_overrides(out, {})
     zp, n = P.finalize(out); imgs, z = packet_outputs(out)
-    return imgs, z, "**Edits reset** — labels and lines are back to the automatic placement."
+    return imgs, z, "**Edits reset** — every image is back to the automatic layout (per-image edits cleared too).", None, None
 
 
 # ---------------- tab 1: generate from parcel ----------------
@@ -390,6 +411,9 @@ footer {display:none !important;}
 .bana-btn {background:#fff;border:1px solid #d9d6cf;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;color:#2b2a27;}
 .bana-btn:hover {background:#f1f0ec;}
 .bana-in {width:100%;box-sizing:border-box;border:1px solid #d9d6cf;border-radius:8px;padding:7px 9px;font-size:13px;background:#fff;color:#111;}
+.bana-row {display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px;}
+.bana-sm {padding:4px 9px;font-size:12px;}
+.bana-chk {font-size:13px;display:flex;align-items:center;gap:6px;margin-top:6px;}
 """
 
 EDITOR_HTML = """
@@ -400,12 +424,24 @@ EDITOR_HTML = """
     <button id="bana-corner" class="bana-btn">+ Corner</button>
     <button id="bana-del" class="bana-btn">Delete selected</button>
     <button id="bana-undo" class="bana-btn">Undo</button>
+    <span style="border-left:1px solid #d9d6cf;height:22px"></span>
+    <button id="bana-toggle-lines" class="bana-btn">Hide lines</button>
+    <button id="bana-toggle-card" class="bana-btn">Hide card</button>
+    <button id="bana-toggle-disc" class="bana-btn">Hide disclaimer</button>
     <span id="bana-acres" style="font-weight:700;color:#1f6f4a;font-size:14px;margin-left:8px"></span>
-    <span id="bana-status" style="color:#5c5a55;font-size:13px;margin-left:6px"></span>
+    <span id="bana-overridden" style="color:#b45309;font-size:12px;font-weight:600;margin-left:6px"></span>
   </div>
+  <div id="bana-status" style="color:#5c5a55;font-size:13px;margin:-2px 0 8px"></div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <div style="flex:1 1 640px;min-width:320px"><canvas id="bana-canvas" style="width:100%;border-radius:10px;background:#111;cursor:crosshair"></canvas></div>
     <div style="flex:0 0 260px;display:flex;flex-direction:column;gap:10px">
+      <div style="background:#f6f5f1;border-radius:10px;padding:10px">
+        <div style="font-weight:600;font-size:13px;margin-bottom:2px">Selected: <span id="bana-selname" style="font-weight:500;color:#5c5a55">nothing</span></div>
+        <div class="bana-row"><span style="font-size:13px">Size</span><button id="bana-smaller" class="bana-btn bana-sm">−</button><button id="bana-bigger" class="bana-btn bana-sm">+</button></div>
+        <div class="bana-row"><span style="font-size:13px">Line width</span><button id="bana-line-smaller" class="bana-btn bana-sm">−</button><button id="bana-line-bigger" class="bana-btn bana-sm">+</button></div>
+        <label class="bana-chk"><input type="checkbox" id="bana-shadow"> Soft shadows (lines, pins, cards)</label>
+        <label class="bana-chk"><input type="checkbox" id="bana-fill" checked> Light fill inside the lines</label>
+      </div>
       <div style="background:#f6f5f1;border-radius:10px;padding:10px">
         <div style="font-weight:600;font-size:13px;margin-bottom:6px">Acreage card</div>
         <input id="bana-title" class="bana-in" placeholder="30.21 ACRES +/-">
@@ -541,13 +577,15 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
 
         # ---------- 4. review & edit ----------
         with gr.Tab("Review & edit", id="edit"):
-            gr.Markdown('<div class="help">Separate step after an asset is created. Pick the run and the image; drag corners, callouts or the acreage card; double-click a callout to rename it; <b>Delete</b> removes the selected item; <b>+ Corner</b> then click on the line adds one. <b>Apply</b> redraws every image in the packet from the same edits.</div>')
+            gr.Markdown('<div class="help">Separate step after an asset is created. Pick the run and the image. Drag a <b>label box</b> to move it, drag its <b>pin</b> to move the point; drag corners, the acreage card or the disclaimer; double-click a label to rename it. <b>Size ±</b> resizes the selected item; <b>Delete</b> removes a label or hides the card / disclaimer; <b>Hide lines</b> removes the outline. <b>Preview</b> shows the exact output without saving. Nothing here calls an API or re-renders — edits are free.</div>')
             with gr.Row():
                 eruns = gr.Dropdown(choices=list_runs(), label="Run (newest first)", scale=3)
                 erefresh = gr.Button("↻", scale=0, min_width=48)
             with gr.Row():
                 ekey = gr.Dropdown(choices=[], label="Image to edit", scale=3)
-                eload = gr.Button("Load", scale=1); eapply = gr.Button("Apply edits & rebuild packet", variant="primary", scale=2); ereset = gr.Button("Reset to automatic", scale=1)
+                eload = gr.Button("Load", scale=1)
+                escope = gr.Radio(["This image only", "Whole packet"], value="This image only", label="Apply to", scale=2)
+                epreview = gr.Button("Preview", scale=1); eapply = gr.Button("Apply", variant="primary", scale=1); ereset = gr.Button("Reset all to automatic", scale=1)
             with gr.Row(visible=False) as lot_tools:
                 lzin = gr.Button("Zoom in", size="sm"); lzout = gr.Button("Zoom out", size="sm"); lsave = gr.Button("Save lot", variant="primary", size="sm"); lzmsg = gr.Markdown()
             lsaved = gr.Markdown()
@@ -555,12 +593,17 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             epayload = gr.Textbox(visible=False); eedits = gr.Textbox(visible=False)
             esummary = gr.Markdown()
             with gr.Row():
-                egallery = gr.Gallery(label="Rebuilt packet", columns=4, height=420, object_fit="cover", show_label=False, scale=3)
-                ezip = gr.File(label="Download packet (zip)", scale=1)
+                epreview_img = gr.Image(label="Preview (exact output, not saved)", height=360, scale=2, interactive=False)
+                with gr.Column(scale=1):
+                    eone = gr.File(label="Download this image")
+                    ezip = gr.File(label="Download packet (zip)")
+            egallery = gr.Gallery(label="Rebuilt packet", columns=4, height=420, object_fit="cover", show_label=False)
+            EXPORT3_JS = "(o, k, e, s) => [o, k, JSON.stringify(window.banaEditor.export()), s]"
             eload.click(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
             ekey.input(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-            eapply.click(apply_and_rebuild, [run_dir, ekey, eedits], [egallery, ezip, esummary], js=EXPORT_JS).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
-            ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary])
+            epreview.click(preview_one, [run_dir, ekey, eedits], [epreview_img], js=EXPORT_JS)
+            eapply.click(apply_and_rebuild, [run_dir, ekey, eedits, escope], [egallery, ezip, esummary, eone, epreview_img], js=EXPORT3_JS).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
+            ereset.click(reset_edits, [run_dir], [egallery, ezip, esummary, eone, epreview_img]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS)
             erefresh.click(lambda: gr.update(choices=list_runs()), None, [eruns])
             eruns.input(pick_run, [eruns], [ekey, run_dir]).then(editor_payload, [run_dir, ekey], [epayload]).then(None, [epayload], None, js=LOAD_JS).then(is_draw_run, [run_dir], [lot_tools])
 

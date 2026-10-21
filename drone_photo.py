@@ -218,7 +218,7 @@ def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref
         if relit.size != img.size: relit = relit.resize(img.size, Image.LANCZOS)
         det, q = P.detect_fiducial(relit)
         if det:
-            clean, _ = P.erase_markers(relit, q.get("_mask"), [], []); relit_pts = det
+            clean, _ = P.erase_markers(relit, q.get("_mask"), [], [], dilate=3, radius=3); relit_pts = det   # thin marker: repaint only its own pixels (no smear band)
             if pm:   # the relit image is the same frame: keep the same map; the marker only confirms the line survived
                 relit_pts = pts
         else:

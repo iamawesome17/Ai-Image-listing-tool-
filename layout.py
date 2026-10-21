@@ -209,20 +209,51 @@ def landcover_callouts(sat, gmap, poly, min_share=0.18):
 
 
 # ---------- drawing ----------
+# Every item carries optional fields the editor controls (all backward compatible — missing = old behaviour):
+#   style:      {"shadow": bool (soft drop shadows under lines/boxes; default off = crisp), "line_scale": 1.0, "line_visible": True, "fill": True}
+#   card:       {..., "scale": 1.0, "visible": True, "off": [dx, dy]}   off = box bottom-centre relative to the pin, in layout units
+#   labels[i]:  {..., "scale": 1.0, "visible": True, "off": [dx, dy]}   (1 unit = 1 px on a 1200 px wide image; mode comes from the sign of dy)
+#   disc:       {"scale": 1.0, "visible": True, "x": 0.98, "y": 0.97}  x/y = right/bottom edge of the text as a fraction of the image
+# PLACEMENT records where everything actually landed on the last render() call, in that image's pixels (the editor shows exactly that).
+PLACEMENT = {}
+DEFAULT_STYLE = {"shadow": False, "line_scale": 1.0, "line_visible": True, "fill": True}
+
+
 def _s(img, base=1200.0): return max(0.6, min(2.2, img.width / base))
 
 
+def style_of(layout): return {**DEFAULT_STYLE, **(layout.get("style") or {})}
+
+
+def _crisp(img, pts, width, closed=True, shadow=False):
+    """White line with a thin dark edge (no blur). With shadow=True a soft drop shadow is added underneath as well."""
+    q = list(pts) + ([pts[0]] if closed else [])
+    def fn(d, sh, off):
+        d.line([(x + off[0], y + off[1]) for x, y in q], fill=sh or (255, 255, 255, 255), width=width, joint="curve")
+    if shadow: ls.shadowed(img, fn, blur=4, offset=(0, 2), alpha=170)
+    d = ImageDraw.Draw(img)
+    d.line(q, fill=(0, 0, 0, 120), width=width + 2, joint="curve")
+    d.line(q, fill=(255, 255, 255, 255), width=width, joint="curve")
+
+
 def draw_card(img, gmap, layout, parcel, scale):
-    cx, cy = gmap.to_px(layout["card"]["lon"], layout["card"]["lat"])
-    cx = min(max(cx, 0.12 * img.width), 0.88 * img.width); cy = min(max(cy, 0.2 * img.height), 0.95 * img.height)
-    lines, sizes, pad = [layout["card"]["title"], layout["card"]["sub"]], [int(58 * scale), int(24 * scale)], (int(22 * scale), int(14 * scale))
+    card = layout["card"]; cs = float(card.get("scale", 1.0) or 1.0); k = scale * cs
+    cx, cy = gmap.to_px(card["lon"], card["lat"])
+    lines, sizes, pad = [card["title"], card["sub"]], [int(58 * k), int(24 * k)], (int(22 * k), int(14 * k))
     (bx0, by0, bx1, by1), _, _ = ls.measure_box(img, (cx, 0), lines, sizes, pad, "top"); box_h = by1 - by0; box_w = bx1 - bx0
-    pin_r = int(24 * scale); top_need = 2.6 * pin_r + box_h + 16 * scale                   # pin + card must stay inside the frame
-    pole_top = (cx, max(0.30 * img.height, top_need, cy - min(260 * scale, img.height * 0.22)))
-    cx = min(max(cx, box_w / 2 + 6), img.width - box_w / 2 - 6)                             # card fully on-frame horizontally
-    ls.draw_pole(img, pole_top, (cx, cy), width=max(3, int(5 * scale)))
-    box = ls.text_box(img, (cx, pole_top[1] - 10 * scale), lines, sizes, pad=pad, radius=int(14 * scale), anchor="bottom")
-    ls.draw_pin(img, (cx, box[1] - 6), r=pin_r)
+    pin_r = int(24 * k)
+    if card.get("off"):
+        bx, by = cx + card["off"][0] * scale, cy + card["off"][1] * scale                     # box bottom-centre, user placed
+    else:
+        cxc = min(max(cx, 0.12 * img.width), 0.88 * img.width); cyc = min(max(cy, 0.2 * img.height), 0.95 * img.height)
+        top_need = 2.6 * pin_r + box_h + 16 * k
+        by = max(0.30 * img.height, top_need, cyc - min(260 * k, img.height * 0.22)) - 10 * k
+        bx = min(max(cxc, box_w / 2 + 6), img.width - box_w / 2 - 6)
+    bx = min(max(bx, box_w / 2 + 2), img.width - box_w / 2 - 2); by = min(max(by, box_h + 2.6 * pin_r), img.height - 2)
+    ls.draw_pole(img, (bx, by + 10 * k), (cx, cy), width=max(3, int(5 * k)))
+    box = ls.text_box(img, (bx, by), lines, sizes, pad=pad, radius=int(14 * k), anchor="bottom")
+    ls.draw_pin(img, (bx, box[1] - 6), r=pin_r)
+    PLACEMENT["card"] = {"x": cx, "y": cy, "bx": bx, "by": by, "box": list(box), "scale": cs}
 
 
 def _place(img, xy, lines, sizes, pad, scale, lead0=58):
@@ -249,87 +280,148 @@ def _place(img, xy, lines, sizes, pad, scale, lead0=58):
     return best or (x, y - lead0 * scale, "bottom", ls.measure_box(img, (x, y - lead0 * scale), lines, sizes, pad, "bottom")[0])
 
 
-def draw_feature(img, xy, text, sub, scale):
+def _explicit(img, xy, off, scale, lines, sizes, pad):
+    """Box position from a stored offset: off = (dx, dy) in layout units from the pin to the box edge nearest the pin."""
+    x, y = xy; bx, by = x + off[0] * scale, y + off[1] * scale
+    mode = "bottom" if off[1] < 0 else "top"
+    box, _, _ = ls.measure_box(img, (bx, by), lines, sizes, pad, mode)
+    sdx = min(0, img.width - 4 - box[2]) + max(0, 4 - box[0]); sdy = min(0, img.height - 4 - box[3]) + max(0, 4 - box[1])
+    return bx + sdx, by + sdy, mode, (box[0] + sdx, box[1] + sdy, box[2] + sdx, box[3] + sdy)
+
+
+def draw_feature(img, xy, lb, scale):
     """Black semi-transparent callout: dot on the feature, leader to a dark rounded label."""
-    x, y = xy
-    lines = [text] + ([sub] if sub else []); sizes = [int(26 * scale)] + ([int(19 * scale)] if sub else [])
-    pad = (int(14 * scale), int(8 * scale))
-    bx, by, mode, box = _place(img, xy, lines, sizes, pad, scale)
+    x, y = xy; k = scale * float(lb.get("scale", 1.0) or 1.0); text, sub = lb["text"], lb.get("sub", "")
+    lines = [text] + ([sub] if sub else []); sizes = [int(26 * k)] + ([int(19 * k)] if sub else [])
+    pad = (int(14 * k), int(8 * k))
+    bx, by, mode, box = _explicit(img, xy, lb["off"], scale, lines, sizes, pad) if lb.get("off") else _place(img, xy, lines, sizes, pad, k)
     end = (bx, box[3] + 2) if mode == "bottom" else (bx, box[1] - 2)
     def fn(d, shadow, off):
-        d.ellipse((x - 6 * scale + off[0], y - 6 * scale + off[1], x + 6 * scale + off[0], y + 6 * scale + off[1]), fill=shadow or (255, 255, 255, 255))
-        d.line([(x + off[0], y + off[1]), (end[0] + off[0], end[1] + off[1])], fill=shadow or (255, 255, 255, 235), width=max(2, int(3 * scale)))
+        d.ellipse((x - 6 * k + off[0], y - 6 * k + off[1], x + 6 * k + off[0], y + 6 * k + off[1]), fill=shadow or (255, 255, 255, 255))
+        d.line([(x + off[0], y + off[1]), (end[0] + off[0], end[1] + off[1])], fill=shadow or (255, 255, 255, 235), width=max(2, int(3 * k)))
     ls.shadowed(img, fn, blur=3, offset=(0, 2), alpha=150)
-    ls.text_box(img, (bx, by), lines, sizes, pad=pad, radius=int(9 * scale), anchor=mode, bg=FEATURE_STYLE["bg"], fg=FEATURE_STYLE["fg"])
+    ls.text_box(img, (bx, by), lines, sizes, pad=pad, radius=int(9 * k), anchor=mode, bg=FEATURE_STYLE["bg"], fg=FEATURE_STYLE["fg"])
+    PLACEMENT[lb.get("id", text)] = {"x": x, "y": y, "bx": bx, "by": by, "mode": mode, "box": list(box)}
 
 
-def draw_road(img, xy, text, scale):
+def draw_road(img, xy, lb, scale):
     """Unobtrusive road marker: small pin on the road, light label near it."""
-    x, y = xy
-    lines, sizes, pad = [text], [int(24 * scale)], (int(14 * scale), int(8 * scale))
-    bx, by, mode, box = _place(img, xy, lines, sizes, pad, scale, lead0=46)
-    ls.draw_pin(img, (x, y), r=int(14 * scale))
-    if mode == "top" or abs(bx - x) > 20 * scale:                       # label not directly above the pin: thin leader
+    x, y = xy; k = scale * float(lb.get("scale", 1.0) or 1.0); text = lb["text"]
+    lines, sizes, pad = [text], [int(24 * k)], (int(14 * k), int(8 * k))
+    bx, by, mode, box = _explicit(img, xy, lb["off"], scale, lines, sizes, pad) if lb.get("off") else _place(img, xy, lines, sizes, pad, k, lead0=46)
+    ls.draw_pin(img, (x, y), r=int(14 * k))
+    if mode == "top" or abs(bx - x) > 20 * k:                       # label not directly above the pin: thin leader
         end = (bx, box[3] + 2) if mode == "bottom" else (bx, box[1] - 2)
-        ImageDraw.Draw(img).line([(x, y - 14 * scale), end], fill=(255, 255, 255, 220), width=max(2, int(2 * scale)))
-    ls.text_box(img, (bx, by), lines, sizes, pad=pad, radius=int(9 * scale), anchor=mode, bg=ROAD_STYLE["bg"], fg=ROAD_STYLE["fg"])
+        ImageDraw.Draw(img).line([(x, y - 14 * k), end], fill=(255, 255, 255, 220), width=max(2, int(2 * k)))
+    ls.text_box(img, (bx, by), lines, sizes, pad=pad, radius=int(9 * k), anchor=mode, bg=ROAD_STYLE["bg"], fg=ROAD_STYLE["fg"])
+    PLACEMENT[lb.get("id", text)] = {"x": x, "y": y, "bx": bx, "by": by, "mode": mode, "box": list(box)}
+
+
+def disc_defaults(img, scale, attribution):
+    """Default disclaimer anchor (right edge, bottom edge) as fractions of the image."""
+    bottom = 70 if attribution else int(26 * scale)
+    return {"x": 1 - 28 / img.width, "y": 1 - bottom / img.height}
+
+
+def draw_disclaimer(img, layout, scale, attribution):
+    disc = {**{"scale": 1.0, "visible": True}, **(layout.get("disc") or {})}
+    text = layout.get("disclaimer", ls.DISCLAIMER)
+    size = int(24 * scale * float(disc.get("scale", 1.0) or 1.0))
+    dflt = disc_defaults(img, scale, attribution); fx, fy = disc.get("x", dflt["x"]), disc.get("y", dflt["y"])
+    d = ImageDraw.Draw(img); f = ls.font(size); w = d.textlength(text, font=f); h = f.getbbox("Ag")[3]
+    x, y = fx * img.width - w, fy * img.height - h
+    x = min(max(x, 4), img.width - w - 4); y = min(max(y, 4), img.height - h - 4)
+    if disc.get("visible", True) and text:
+        for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2), (0, 3)]:
+            d.text((x + dx, y + dy), text, font=f, fill=(0, 0, 0, 200))
+        d.text((x, y), text, font=f, fill=(255, 255, 255, 255))
+    PLACEMENT["disc"] = {"x": fx, "y": fy, "box": [x, y, x + w, y + h], "size": size, "visible": disc.get("visible", True), "scale": disc.get("scale", 1.0)}
 
 
 def render(img, gmap, layout, parcel, pois=(), boundary_px=None, show_card=True, show_labels=True, attribution=False):
     """Draw the full layout on an RGBA image using its ground map. boundary_px overrides the mapped polygon (e.g. detected marker)."""
-    out = img.copy(); scale = _s(out); ls.PLACED.clear()
-    pts = boundary_px or [gmap.to_px(x, y) for x, y in layout["boundary"]]
-    fill = Image.new("RGBA", out.size, (0, 0, 0, 0)); ImageDraw.Draw(fill).polygon(pts, fill=(255, 255, 255, 34)); out.alpha_composite(fill)
-    def fn(d, shadow, off):
-        q = [(x + off[0], y + off[1]) for x, y in pts]; d.line(q + [q[0]], fill=shadow or (255, 255, 255, 255), width=max(3, int(5 * scale)), joint="curve")
-    ls.shadowed(out, fn, blur=4, offset=(0, 2), alpha=170)
-    if show_card: draw_card(out, gmap, layout, parcel, scale)
-    xs, ys = zip(*pts); ls.PLACED.append((min(xs), min(ys), max(xs), max(ys))) if not show_labels else None
-    if show_labels:
-        inside = lambda x, y, pad: pad <= x <= out.width - pad and pad <= y <= out.height - pad
-        for lb in sorted(layout["labels"], key=lambda l: (l["kind"] != "feature", l["text"])):
-            x, y = gmap.to_px(lb["lon"], lb["lat"])
-            if not inside(x, y, 24): continue
-            if lb["kind"] == "feature": draw_feature(out, (x, y), lb["text"], lb.get("sub", ""), scale)
-            elif lb["kind"] == "road": draw_road(out, (x, y), lb["text"], scale)
-        for p in pois:
-            x, y = gmap.to_px(p["lon"], p["lat"])
-            if inside(x, y, 140) and not Polygon(layout["boundary"]).contains(Point(p["lon"], p["lat"])):
-                ls.draw_poi(out, (x, y), p["name"], p["type"])
-    ls.draw_disclaimer(out, layout.get("disclaimer", ls.DISCLAIMER), size=int(24 * scale), bottom=70 if attribution else int(26 * scale))
+    out = img.copy(); scale = _s(out); ls.PLACED.clear(); PLACEMENT.clear()
+    st = style_of(layout); ls.SHADOWS = bool(st.get("shadow"))
+    try:
+        pts = boundary_px or [gmap.to_px(x, y) for x, y in layout["boundary"]]
+        PLACEMENT["boundary"] = {"px": [list(p) for p in pts], "visible": bool(st.get("line_visible", True)), "line_scale": st.get("line_scale", 1.0)}
+        if st.get("line_visible", True) and len(pts) >= 2:
+            if st.get("fill", True) and len(pts) >= 3:
+                fill = Image.new("RGBA", out.size, (0, 0, 0, 0)); ImageDraw.Draw(fill).polygon(pts, fill=(255, 255, 255, 34)); out.alpha_composite(fill)
+            _crisp(out, pts, max(2, int(round(5 * scale * float(st.get("line_scale", 1.0) or 1.0)))), closed=len(pts) >= 3, shadow=ls.SHADOWS)
+        if show_card and layout["card"].get("visible", True): draw_card(out, gmap, layout, parcel, scale)
+        if len(pts) >= 2:
+            xs, ys = zip(*pts); ls.PLACED.append((min(xs), min(ys), max(xs), max(ys))) if not show_labels else None
+        if show_labels:
+            inside = lambda x, y, pad: pad <= x <= out.width - pad and pad <= y <= out.height - pad
+            for lb in sorted(layout["labels"], key=lambda l: (l["kind"] != "feature", l["text"])):
+                if not lb.get("visible", True): continue
+                x, y = gmap.to_px(lb["lon"], lb["lat"])
+                if not inside(x, y, 24): continue
+                if lb["kind"] == "feature": draw_feature(out, (x, y), lb, scale)
+                elif lb["kind"] == "road": draw_road(out, (x, y), lb, scale)
+            for p in pois:
+                x, y = gmap.to_px(p["lon"], p["lat"])
+                if inside(x, y, 140) and not Polygon(layout["boundary"]).contains(Point(p["lon"], p["lat"])):
+                    ls.draw_poi(out, (x, y), p["name"], p["type"])
+        draw_disclaimer(out, layout, scale, attribution)
+    finally:
+        ls.SHADOWS = True
     return out
 
 
-def layout_px(layout, gmap):
-    """Layout expressed in this image's pixels (for the editor)."""
+def layout_px(layout, gmap, placement=None, scale=1.0):
+    """Layout expressed in this image's pixels (for the editor). With `placement` (from a render() dry run) every box carries
+    the exact pixel position it was drawn at, so the editor shows the output, not an approximation."""
+    pl = placement or {}
+    card = layout["card"]; cpx = gmap.to_px(card["lon"], card["lat"]); cpl = pl.get("card", {})
+    labs = []
+    for l in layout["labels"]:
+        x, y = gmap.to_px(l["lon"], l["lat"]); p = pl.get(l.get("id"), {})
+        labs.append({**l, "x": x, "y": y, "bx": p.get("bx", x), "by": p.get("by", y - 58 * scale), "mode": p.get("mode", "bottom"), "scale": l.get("scale", 1.0), "visible": l.get("visible", True)})
+    disc = {**{"scale": 1.0, "visible": True}, **(layout.get("disc") or {}), **{k: v for k, v in pl.get("disc", {}).items() if k in ("x", "y", "box", "size")}}
     return {"boundary": [list(gmap.to_px(x, y)) for x, y in layout["boundary"]],
-            "card": {**layout["card"], "x": gmap.to_px(layout["card"]["lon"], layout["card"]["lat"])[0], "y": gmap.to_px(layout["card"]["lon"], layout["card"]["lat"])[1]},
-            "labels": [{**l, "x": gmap.to_px(l["lon"], l["lat"])[0], "y": gmap.to_px(l["lon"], l["lat"])[1]} for l in layout["labels"]],
-            "disclaimer": layout.get("disclaimer", ls.DISCLAIMER)}
+            "card": {**card, "x": cpx[0], "y": cpx[1], "bx": cpl.get("bx", cpx[0]), "by": cpl.get("by", cpx[1] - 200 * scale), "scale": card.get("scale", 1.0), "visible": card.get("visible", True)},
+            "labels": labs, "disclaimer": layout.get("disclaimer", ls.DISCLAIMER), "disc": disc, "style": style_of(layout), "scale": scale}
 
 
-def apply_px_edits(layout, edits, gmap, shown=None, tol=1.5):
-    """Fold pixel-space edits from the editor back into the ground layout. edits = {boundary:[[x,y]..] | None, card:{title,sub,x,y}, labels:[{id,kind,text,sub,x,y}], disclaimer}
-    shown: the pixel layout the editor was given (layout_px); items the user did not move keep their original ground position."""
+def apply_px_edits(layout, edits, gmap, shown=None, tol=1.5, scale=1.0):
+    """Fold pixel-space edits from the editor back into the ground layout.
+    edits = {boundary:[[x,y]..] | None, card:{title,sub,x,y,bx,by,scale,visible}, labels:[{id,kind,text,sub,x,y,bx,by,scale,visible}],
+             disclaimer, disc:{x,y,scale,visible}, style:{shadow,line_scale,line_visible,fill}}
+    shown: the pixel layout the editor was given (layout_px); items the user did not move keep their original ground position.
+    Box positions (bx, by) are stored as offsets from the pin in layout units so they carry across images."""
     new = json.loads(json.dumps(layout))
     shown_lab = {l["id"]: (l["x"], l["y"]) for l in (shown or {}).get("labels", [])}
     unmoved = lambda a, b: a is not None and math.hypot(a[0] - b[0], a[1] - b[1]) <= tol
+    off_of = lambda d: [round((d["bx"] - d["x"]) / scale, 1), round((d["by"] - d["y"]) / scale, 1)] if "bx" in d and "by" in d else None
     if edits.get("boundary"):
         new["boundary"] = [list(gmap.to_ll(x, y)) for x, y in edits["boundary"]]
     if edits.get("card"):
         cd = edits["card"]
         if shown and unmoved((shown["card"]["x"], shown["card"]["y"]), (cd["x"], cd["y"])): lon, lat = layout["card"]["lon"], layout["card"]["lat"]
         else: lon, lat = gmap.to_ll(cd["x"], cd["y"])
-        new["card"] = {"title": cd.get("title", layout["card"]["title"]), "sub": cd.get("sub", layout["card"]["sub"]), "lon": lon, "lat": lat}
+        new["card"] = {"title": cd.get("title", layout["card"]["title"]), "sub": cd.get("sub", layout["card"]["sub"]), "lon": lon, "lat": lat,
+                       "scale": float(cd.get("scale", layout["card"].get("scale", 1.0)) or 1.0), "visible": bool(cd.get("visible", True))}
+        off = off_of(cd)
+        if off: new["card"]["off"] = off
     if "labels" in edits:
         orig = {l["id"]: l for l in layout["labels"]}; labs = []
         for l in edits["labels"]:
             lid = l.get("id") or f"u{len(labs)}"
             if lid in orig and unmoved(shown_lab.get(lid), (l["x"], l["y"])): lon, lat = orig[lid]["lon"], orig[lid]["lat"]
             else: lon, lat = gmap.to_ll(l["x"], l["y"])
-            labs.append({"id": lid, "kind": l.get("kind", "feature"), "text": l.get("text", ""), "sub": l.get("sub", ""), "lon": lon, "lat": lat})
+            rec = {"id": lid, "kind": l.get("kind", "feature"), "text": l.get("text", ""), "sub": l.get("sub", ""), "lon": lon, "lat": lat,
+                   "scale": float(l.get("scale", 1.0) or 1.0), "visible": bool(l.get("visible", True))}
+            off = off_of(l)
+            if off: rec["off"] = off
+            labs.append(rec)
         new["labels"] = labs
     if "disclaimer" in edits: new["disclaimer"] = edits["disclaimer"]
+    if edits.get("disc"):
+        dc = edits["disc"]; new["disc"] = {**(layout.get("disc") or {}), **{k: dc[k] for k in ("x", "y", "scale", "visible") if k in dc}}
+    if edits.get("style"):
+        new["style"] = {**style_of(layout), **{k: edits["style"][k] for k in DEFAULT_STYLE if k in edits["style"]}}
     return new
 
 

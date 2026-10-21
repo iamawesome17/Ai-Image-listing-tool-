@@ -26,7 +26,7 @@ Output: out/<PIN>/packet_<address>.zip (numbered images + README + scan.json) an
 | 6 | outline | Detect the magenta marker in each render (HSV threshold → largest contour → simplified polygon), inpaint it away, draw the styled outline + pin + card + disclaimer | OpenCV + Pillow | ai/*_outline.jpg, ai/outline_report.json |
 | 7 | packet | Number files in Zillow order (golden-hour cover first), README, zip, run log | — | packet_*.zip, run.json |
 
-Default plan: nadir ×2 (day, golden) + S/E/W/N ×2 = 10 renders at 2K; close-ups are crops of the same renders (no extra cost).
+Default plan: nadir ×2 (day, golden) + S/E/W/N ×2 + 2 low-horizon views ×2 = 14 renders at 2K (+ a 1K retry for any render that loses the marker); close-ups are crops of the same renders (no extra cost). `--res 1k`, `--lights golden`, `--low none` each cut the bill.
 `--angles` and `--lights` override. Diagonals (NE/SE/SW/NW) need the upload host (see Hosting/Domains).
 
 ## Why it is built this way (decisions)
@@ -113,8 +113,22 @@ in `maps.json` that turns lon/lat into its pixels:
 - real drone photos: homography from the metadata projection, or from corners the user drags in the editor (exact vertex correspondence,
   RANSAC when ≥6), or a rough bbox map until then (auto callouts hidden).
 `pipeline.py --finalize out/<PIN>` redraws every image from the layout and rebuilds the packet without any API call; the editor's
-**Apply edits & rebuild packet** does the same after folding the pixel edits back through that image's ground map. Unmoved items keep their
-exact ground position; moved items are re-projected. Low horizon views (`--low auto`: road side + opposite) use a near-ground prompt and a
+**Apply** does the same after folding the pixel edits back through that image's ground map. Unmoved items keep their
+exact ground position; moved items are re-projected. **Nothing in Review & edit calls an API — edits cost $0.**
+
+Editor fields (all optional in layout.json; old files still render): `style` {shadow (default off = crisp white line with a thin dark
+edge; on = soft drop shadows under lines, pins and cards), line_scale, line_visible, fill}; `card` {scale, visible, off: [dx, dy]};
+`labels[i]` {scale, visible, off: [dx, dy]} — `off` is the label box position relative to its pin in *layout units* (1 unit = 1 px on a
+1200-px-wide image) so a placement carries to every view; `disc` {x, y (right/bottom edge as fractions of the image), scale, visible}.
+A label box and its pin move independently (drag the box, or drag the pin to move both); Size ± resizes the selected label / card /
+disclaimer (or the line width when a corner is selected); Delete removes a label or hides the card / disclaimer; Hide lines removes the
+outline (a polygon always keeps ≥3 corners). **Preview** renders the exact output server-side without saving.
+
+**Apply to: This image only** writes `out/<PIN>/overrides.json` ({image key: layout}) — that image is drawn from its own layout from then
+on and the rest of the packet is untouched; **Whole packet** updates `layout.json`, and images with an override keep their own edits.
+Shared geometry (boundary, dragged-corner refit on photos, acreage) always applies everywhere. *Reset all to automatic* clears both.
+The editor payload comes from a server dry-run render (`layout.PLACEMENT`), so every box is shown at the pixel the server drew it, with
+the same fonts, paddings and sizes — the canvas is the output. *Download this image* gives the single finished file. Low horizon views (`--low auto`: road side + opposite) use a near-ground prompt and a
 bottom-anchored crop that keeps the sky. The plat exhibit (plat.py) is drawn from the same boundary: bearings/distances per course, PLSS
 section-township-range (BLM CadNSDI), adjoiner PINs, roads, north arrow, scale bar, course table — "not a survey" footer.
 
@@ -127,7 +141,7 @@ Puts the true property line (and the acreage card, road labels, disclaimer) on a
    (4+ clicks → the parcel shape is matched to the clicks and the true outline with every jog is drawn), or just press Annotate: the true parcel shape is
    placed in the middle and you **drag its corners** onto the real corners in Review & edit — 4 moved corners are enough, the rest snap into place and the
    callouts appear (validated at 1.8 px on a synthetic frame).
-2. Golden hour: the polygon is drawn as a thin magenta marker, Grok re-lights the photo keeping the marker, the marker is detected, erased and redrawn as the styled line.
+2. Golden hour: the polygon is drawn as a thin magenta marker, Grok re-lights the photo keeping the marker, the marker is detected, erased (inpaint with a 3-px dilation — the earlier 7-px band showed as a smear along the line) and redrawn as the styled line.
    Outputs: `<photo>_original_with_lines.jpg`, `<photo>_golden_with_lines.jpg`, `<photo>_golden_no_lines.jpg`.
 Camera: DJI Mini 2 (24 mm equiv, 4:3) is the reference; any DJI with the same tags works.
 

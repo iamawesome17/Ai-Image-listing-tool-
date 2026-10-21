@@ -288,12 +288,16 @@ def font(size, bold=True):
     return ImageFont.truetype(FONT_BOLD if bold else FONT_MED, size)
 
 
+SHADOWS = True      # layout.render() sets this from layout["style"]["shadow"]; False = crisp (no blurred drop shadows anywhere)
+
+
 def shadowed(img, draw_fn, blur=6, offset=(0, 4), alpha=140):
-    """Draw draw_fn onto a shadow layer, blur it, composite, then draw for real."""
-    sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw_fn(ImageDraw.Draw(sh), (0, 0, 0, alpha), offset)
-    sh = sh.filter(ImageFilter.GaussianBlur(blur))
-    img.alpha_composite(sh)
+    """Draw draw_fn onto a shadow layer, blur it, composite, then draw for real. With SHADOWS off only the real pass runs."""
+    if SHADOWS:
+        sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw_fn(ImageDraw.Draw(sh), (0, 0, 0, alpha), offset)
+        sh = sh.filter(ImageFilter.GaussianBlur(blur))
+        img.alpha_composite(sh)
     draw_fn(ImageDraw.Draw(img), None, (0, 0))
 
 
@@ -359,9 +363,14 @@ def draw_pin(img, xy, color=(220, 38, 38, 255), r=22):
 
 
 def draw_pole(img, top, bottom, width=5):
+    r = max(5, int(width * 1.4))
     def fn(d, shadow, off):
         d.line([(top[0] + off[0], top[1] + off[1]), (bottom[0] + off[0], bottom[1] + off[1])], fill=shadow or (255, 255, 255, 255), width=width)
-        d.ellipse((bottom[0] - 7 + off[0], bottom[1] - 7 + off[1], bottom[0] + 7 + off[0], bottom[1] + 7 + off[1]), fill=shadow or (255, 255, 255, 255))
+        d.ellipse((bottom[0] - r + off[0], bottom[1] - r + off[1], bottom[0] + r + off[0], bottom[1] + r + off[1]), fill=shadow or (255, 255, 255, 255))
+    if not SHADOWS:
+        d = ImageDraw.Draw(img)
+        d.line([top, bottom], fill=(0, 0, 0, 120), width=width + 2)
+        d.ellipse((bottom[0] - r - 1, bottom[1] - r - 1, bottom[0] + r + 1, bottom[1] + r + 1), fill=(0, 0, 0, 120))
     shadowed(img, fn, blur=4, offset=(0, 3), alpha=160)
 
 

@@ -655,8 +655,9 @@ def detect_lines(img, hue_band, min_px=400):
     return comps, m
 
 
-def erase_markers(img, mask, roads=None, power=None):
-    """Detect road / power markers (labels), erase every marker by inpainting. Returns (clean image, labels[(xy, text)])."""
+def erase_markers(img, mask, roads=None, power=None, dilate=7, radius=5):
+    """Detect road / power markers (labels), erase every marker by inpainting. Returns (clean image, labels[(xy, text)]).
+    dilate/radius: how far around the marker to repaint — keep small for thin markers (real photos) or the band shows as a smear."""
     labels = []
     erase = mask.copy() if mask is not None else np.zeros((img.height, img.width), np.uint8)
     for r, (_, _, band) in zip(roads or [], ROAD_COLORS):
@@ -670,7 +671,7 @@ def erase_markers(img, mask, roads=None, power=None):
     out = img.copy()
     if erase.any():
         bgr = cv2.cvtColor(np.array(out.convert("RGB")), cv2.COLOR_RGB2BGR)
-        bgr = cv2.inpaint(bgr, cv2.dilate(erase, np.ones((7, 7), np.uint8)), 5, cv2.INPAINT_TELEA)
+        bgr = cv2.inpaint(bgr, cv2.dilate(erase, np.ones((dilate, dilate), np.uint8)), radius, cv2.INPAINT_TELEA)
         out = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
     return out, labels
 
@@ -1012,68 +1013,138 @@ def prepare(out, key, rec, layout, variant="", out_size=(1152, 864)):
     return crop, gmap, bpx
 
 
+def load_overrides(out):
+    """Per-image layouts (out/overrides.json: {image key: layout}). An image with an override is drawn from it instead of layout.json."""
+    f = Path(out) / "overrides.json"
+    try: return json.loads(f.read_text()) if f.exists() else {}
+    except Exception: return {}
+
+
+def save_overrides(out, ov):
+    f = Path(out) / "overrides.json"
+    if ov: f.write_text(json.dumps(ov, indent=1))
+    elif f.exists(): f.unlink()
+
+
+def layout_for(out, key, layout, overrides=None):
+    ov = load_overrides(out) if overrides is None else overrides
+    return ov.get(key) or layout
+
+
+def _centroid_map(bpx):
+    class _C:
+        def to_px(self_, lon, lat): return (sum(p[0] for p in bpx) / len(bpx), sum(p[1] for p in bpx) / len(bpx))
+        def to_ll(self_, x, y): return (0.0, 0.0)
+    return _C()
+
+
+def effective(rec, layout, gmap, bpx):
+    """(layout, gmap, show_labels) actually used to draw this image — mirrors the special cases below so the editor shows the same thing."""
+    if rec["kind"] == "satellite": return layout, gmap, True
+    if gmap is None: return layout, _centroid_map(bpx), False            # corners only / weak fit: boundary + card, no callouts
+    if rec.get("rough"):                                                  # rough map: only labels the user placed in the editor
+        lay2 = dict(layout); lay2["labels"] = [l for l in layout["labels"] if str(l.get("id", "")).startswith("u")]
+        return lay2, gmap, True
+    return layout, gmap, True
+
+
 def draw_one(out, key, rec, parcel, layout, scan, variant=""):
     """Render one output image from its clean source + ground map (+ crop variant). Returns PIL image or None."""
     img, gmap, bpx = prepare(out, key, rec, layout, variant)
     if img is None: return None
+    lay, gm, show_labels = effective(rec, layout, gmap, bpx)
     if rec["kind"] == "satellite":
-        return L.render(img, gmap, layout, parcel, pois=scan.get("pois", [])[:3] if rec.get("pois") else [], attribution=True)
-    if rec["kind"] == "photo" and gmap is None:                 # corners only: boundary + card at the polygon centre
-        class _C:
-            def to_px(self_, lon, lat): return (sum(p[0] for p in bpx) / len(bpx), sum(p[1] for p in bpx) / len(bpx))
-        return L.render(img, _C(), layout, parcel, boundary_px=bpx, show_labels=False)
-    if rec.get("rough"):                                         # rough map: only labels the user placed in the editor
-        lay2 = dict(layout); lay2["labels"] = [l for l in layout["labels"] if str(l.get("id", "")).startswith("u")]
-        return L.render(img, gmap, lay2, parcel, boundary_px=bpx)
-    if gmap is None:                                            # weak fit: boundary + card only, no feature callouts
-        class _M:
-            def to_px(self_, lon, lat): return (sum(p[0] for p in bpx) / len(bpx), sum(p[1] for p in bpx) / len(bpx))
-        return L.render(img, _M(), layout, parcel, boundary_px=bpx, show_labels=False)
-    return L.render(img, gmap, layout, parcel, boundary_px=bpx)
+        return L.render(img, gm, lay, parcel, pois=scan.get("pois", [])[:3] if rec.get("pois") else [], attribution=True)
+    return L.render(img, gm, lay, parcel, boundary_px=bpx, show_labels=show_labels)
 
 
 def editor_payload(out, key, variant=""):
-    """What the web editor needs for one image: the clean image (data URL), its size, and the layout in that image's pixels."""
+    """What the web editor needs for one image: the clean image (data URL), its size, and the layout in that image's pixels —
+    every box at the exact pixel position the server draws it (a dry-run render records the placement)."""
     import base64
     out = Path(out); parcel, layout, maps, scan = load_state(out)
-    rec = maps[key]; img, gmap, bpx = prepare(out, key, rec, layout, variant)
+    ov = load_overrides(out); lay = ov.get(key) or layout
+    rec = maps[key]; img, gmap, bpx = prepare(out, key, rec, lay, variant)
     if img is None or gmap is None: return None
+    lay_eff, gm, show_labels = effective(rec, lay, gmap, bpx)
+    L.render(img, gm, lay_eff, parcel, boundary_px=bpx, show_labels=show_labels, attribution=rec["kind"] == "satellite")   # dry run → L.PLACEMENT
+    placement = dict(L.PLACEMENT); scale = L._s(img)
     buf = io.BytesIO(); img.convert("RGB").save(buf, "JPEG", quality=88)
-    lp = L.layout_px(layout, gmap); lp["boundary"] = [list(p) for p in bpx]
-    lp["reference"] = [list(gmap.to_px(x, y)) for x, y in layout.get("reference", [])]
+    lp = L.layout_px(lay_eff, gmap, placement, scale); lp["boundary"] = [list(p) for p in bpx]
+    lp["reference"] = [list(gmap.to_px(x, y)) for x, y in lay.get("reference", [])]
     mpp = None
     if rec["kind"] == "satellite":                               # metres per pixel at the frame centre → live acreage in the editor
         fr = gmap.frame; mpp = 156543.03392 * math.cos(math.radians(fr.lat)) / (2 ** fr.z) / ls.SCALE
     return {"key": key, "image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), "W": img.width, "H": img.height, "layout": lp, "mpp": mpp,
-            "draw": bool(maps.get("_meta", {}).get("draw"))}
+            "draw": bool(maps.get("_meta", {}).get("draw")), "overridden": key in ov, "show_labels": show_labels}
 
 
-def apply_edits(out, key, edits, variant=""):
-    """Fold editor output (pixel space of `key`) into layout.json, then rebuild everything. Returns (zip, n)."""
+def _edited_layout(out, key, edits, variant=""):
+    """Fold editor pixels into a ground layout for `key` (override if it has one, else the shared layout). Returns (new_layout, refit, parcel, layout, maps, img)."""
     out = Path(out); parcel, layout, maps, scan = load_state(out)
-    rec = maps[key]; img, gmap, bpx = prepare(out, key, rec, layout, variant)
+    base = load_overrides(out).get(key) or layout
+    rec = maps[key]; img, gmap, bpx = prepare(out, key, rec, base, variant)
     refit = None
-    if rec["kind"] == "photo" and edits.get("boundary_edited") and len(edits.get("boundary", [])) == len(layout["boundary"]):
+    if rec["kind"] == "photo" and edits.get("boundary_edited") and len(edits.get("boundary", [])) == len(base["boundary"]):
         # dragged corners ↔ parcel vertices are exact correspondences → fit the real ground map from the moved ones
         old = rec.get("boundary_px") or []
         moved = [i for i, (q, o) in enumerate(zip(edits["boundary"], old)) if math.hypot(q[0] - o[0], q[1] - o[1]) > 2.5] if len(old) == len(edits["boundary"]) else []
         if len(moved) >= 4:
-            ll = [tuple(layout["boundary"][i]) for i in moved]; px = [tuple(edits["boundary"][i]) for i in moved]
+            ll = [tuple(base["boundary"][i]) for i in moved]; px = [tuple(edits["boundary"][i]) for i in moved]
             pm = L.PlaneMap.fit(ll, px, img.width, img.height, ransac=8.0 if len(moved) >= 6 else 0.0)
             import drone_photo as D
-            if pm and D._sane(pm, [tuple(v) for v in layout["boundary"]], px): refit = pm
+            if pm and D._sane(pm, [tuple(v) for v in base["boundary"]], px): refit = pm
             log("edit", "ground map refit from dragged corners", moved=len(moved), ok=bool(refit), err=round(pm.error, 1) if pm else None)
-    shown = L.layout_px(layout, gmap) if gmap else None
-    new = L.apply_px_edits(layout, edits, refit or gmap, shown)
+    gm = refit or gmap or _centroid_map(bpx)
+    shown = L.layout_px(base, gm) if gmap else None
+    new = L.apply_px_edits(base, edits, gm, shown, scale=L._s(img))
+    if rec.get("rough") and "labels" in edits:                           # the editor only showed user-placed labels; keep the automatic ones
+        seen = {l["id"] for l in new["labels"]}
+        new["labels"] += [l for l in base["labels"] if not str(l.get("id", "")).startswith("u") and l["id"] not in seen]
     if edits.get("boundary_edited"): new["boundary_edited"] = True
+    return new, refit, parcel, layout, maps, img, rec, bpx
+
+
+def preview(out, key, edits, variant=""):
+    """Render one image with the editor's current (unsaved) edits. No files change. Returns a PIL image."""
+    out = Path(out); new, refit, parcel, layout, maps, img, rec, bpx = _edited_layout(out, key, edits, variant)
+    scan = json.loads((out / "scan.json").read_text()) if (out / "scan.json").exists() else {}
+    if refit:
+        rec = dict(rec); rec["map"] = refit.to_json(); rec["rough"] = False; rec["boundary_px"] = [list(refit.to_px(x, y)) for x, y in layout["boundary"]]
+        new["boundary"] = layout["boundary"]; new["boundary_edited"] = False
+    return draw_one(out, key, rec, parcel, new, scan, variant)
+
+
+def output_file(out, key):
+    """Path of the finished (drawn) image for `key`, main variant."""
+    out = Path(out); maps = json.loads((out / "maps.json").read_text()); rec = maps[key]
+    if rec["kind"] == "satellite": return out / f"{key}.png"
+    if rec["kind"] == "photo": return out / f"{key}_with_lines.jpg"
+    return out / "ai" / f"{key}_outline.jpg"
+
+
+def apply_edits(out, key, edits, variant="", scope="all"):
+    """Fold editor output (pixel space of `key`) into the layout, then rebuild. Returns (zip, n).
+    scope="all": update layout.json — every image without its own override follows (overrides keep their own edits).
+    scope="one": write this image's own override only; the rest of the packet is untouched.
+    Geometry (dragged photo corners → ground-map refit, boundary edits, acreage) is always shared."""
+    out = Path(out); new, refit, parcel, layout, maps, img, rec, bpx = _edited_layout(out, key, edits, variant)
+    ov = load_overrides(out)
+    if scope == "one":
+        one = new; new = json.loads(json.dumps(layout))
+        for k in ("boundary", "boundary_edited"):
+            if k in one: new[k] = one[k]
+        one.pop("boundary_edited", None); one["boundary"] = new["boundary"]; ov[key] = one; save_overrides(out, ov)
     if refit:
         for k2, r2 in maps.items():
             if not k2.startswith("_") and r2["kind"] == "photo":
                 r2["map"] = refit.to_json(); r2["rough"] = False; r2["fit"] = f"fit from dragged corners, {refit.error:.1f} px"
                 r2["boundary_px"] = [list(refit.to_px(x, y)) for x, y in layout["boundary"]]
         new["boundary"] = layout["boundary"]; new["boundary_edited"] = False
+        for o in ov.values(): o["boundary"] = layout["boundary"]
+        save_overrides(out, ov)
         (out / "maps.json").write_text(json.dumps(maps, indent=1))
-    if edits.get("card"):
+    if edits.get("card") and scope == "all":
         t = edits["card"].get("title", "")
         import re as _re
         mm = _re.search(r"([\d.]+)\s*ACRES", t.upper())
@@ -1083,6 +1154,9 @@ def apply_edits(out, key, edits, variant=""):
     if new.get("boundary_edited") and not parcel.get("no_geo"):
         parcel["acres"] = round(ls.acres_from_polygon(Polygon(new["boundary"])), 2) if not edits.get("card") else parcel["acres"]
         new["card"]["title"] = f"{parcel['acres']:.2f} ACRES +/-" if not edits.get("card") else new["card"]["title"]
+    if new.get("boundary_edited") and ov:                                 # shared boundary moved: every override follows it
+        for o in ov.values(): o["boundary"] = new["boundary"]
+        save_overrides(out, ov)
     (out / "layout.json").write_text(json.dumps(new, indent=1))
     (out / "parcel.json").write_text(json.dumps({k: v for k, v in parcel.items() if k not in ("polygon", "raw", "feature")}, indent=1, default=str))
     return finalize(out)
@@ -1090,21 +1164,22 @@ def apply_edits(out, key, edits, variant=""):
 
 def finalize(out):
     """Draw every image from layout.json + maps.json, write the packet folder + zip. No API calls. Returns (zip path, n images)."""
-    out = Path(out); parcel, layout, maps, scan = load_state(out)
+    out = Path(out); parcel, layout, maps, scan = load_state(out); ov = load_overrides(out)
     meta = maps.get("_meta", {}); model = meta.get("model", "grok"); angles = meta.get("angles", []); lights = meta.get("lights", []); low = meta.get("low", [])
     files = {}
     for key, rec in maps.items():
         if key.startswith("_"): continue
+        lay = ov.get(key) or layout
         if rec["kind"] == "satellite":
-            g = draw_one(out, key, rec, parcel, layout, scan)
+            g = draw_one(out, key, rec, parcel, lay, scan)
             if g is not None: g.convert("RGB").save(out / f"{key}.png"); files[key] = out / f"{key}.png"
             continue
         if rec["kind"] == "photo":
-            g = draw_one(out, key, rec, parcel, layout, scan)
+            g = draw_one(out, key, rec, parcel, lay, scan)
             if g is not None: g.convert("RGB").save(out / f"{key}_with_lines.jpg", quality=94); files[key] = out / f"{key}_with_lines.jpg"
             continue
         for variant in ("", "close"):
-            g = draw_one(out, key, rec, parcel, layout, scan, variant)
+            g = draw_one(out, key, rec, parcel, lay, scan, variant)
             if g is None: continue
             name = f"{key}{'_' + variant if variant else ''}_outline.jpg"
             g.convert("RGB").save(out / "ai" / name, quality=94); files[key + (":" + variant if variant else "")] = out / "ai" / name
