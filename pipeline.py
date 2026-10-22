@@ -931,20 +931,25 @@ def main():
     print("6/7 outline detection + ground fit", flush=True)
     for p in sorted((out / "ai").glob(f"{a.model}_*.jpg")):
         if p.stem.endswith("_clean") or p.stem.endswith("_outline"): continue
-        img = Image.open(p).convert("RGBA")
-        pts, q = detect_fiducial(img)
-        parts = p.stem.split("_"); view, light = parts[1], parts[-1]; is_low = "low" in parts
-        rec = {"src": f"ai/{p.stem}_clean.jpg", "kind": "render", "view": view, "light": light, "low": is_low, "fiducial": {k: v for k, v in q.items() if k != "_mask"}}
-        if pts:
-            clean, _ = erase_markers(img, q.pop("_mask", None), [], [])
-            clean.convert("RGB").save(out / "ai" / f"{p.stem}_clean.jpg", quality=95)
-            init = L.FrameMap(frame) if view in ("S", "nadir") else L.RotMap(frame_sq, COMPASS.get(view, 180) - 180)
-            pm, err, bpx = L.fit_render_map(init, poly, pts, img.width, img.height, mask=q.get("_mask"))
-            rec.update({"map": pm.to_json() if pm else None, "boundary_px": bpx, "fit_err_px": round(err, 1)})
-            maps[p.stem] = rec
-            print(f"    {p.stem}: marker ok, ground fit {'OK' if pm else 'weak'} ({err:.0f} px)")
-        else:
-            print(f"    {p.stem}: NO marker {rec['fiducial']}")
+        try:   # one bad render is skipped, never fails the whole packet
+            img = Image.open(p).convert("RGBA")
+            pts, q = detect_fiducial(img)
+            parts = p.stem.split("_"); view, light = parts[1], parts[-1]; is_low = "low" in parts
+            rec = {"src": f"ai/{p.stem}_clean.jpg", "kind": "render", "view": view, "light": light, "low": is_low, "fiducial": {k: v for k, v in q.items() if k != "_mask"}}
+            if pts:
+                mask = q.pop("_mask", None)
+                clean, _ = erase_markers(img, mask, [], [])
+                clean.convert("RGB").save(out / "ai" / f"{p.stem}_clean.jpg", quality=95)
+                init = L.FrameMap(frame) if view in ("S", "nadir") else L.RotMap(frame_sq, COMPASS.get(view, 180) - 180)
+                pm, err, bpx = L.fit_render_map(init, poly, pts, img.width, img.height)   # same as before: fit to the detected polygon
+                rec.update({"map": pm.to_json() if pm else None, "boundary_px": bpx, "fit_err_px": round(err, 1)})
+                maps[p.stem] = rec
+                print(f"    {p.stem}: marker ok, ground fit {'OK' if pm else 'weak'} ({err:.0f} px)")
+            else:
+                print(f"    {p.stem}: NO marker {rec['fiducial']}")
+        except Exception as e:
+            log("fit", "skipped render", key=p.stem, err=f"{type(e).__name__}: {str(e)[:160]}")
+            print(f"    {p.stem}: skipped ({type(e).__name__}: {str(e)[:120]})")
     save_state(out, parcel, maps)
 
     # 7 draw + packet

@@ -54,8 +54,15 @@ class PlaneMap:
     def fit(cls, ll_pts, px_pts, W, H_px, ransac=0.0):
         origin = (sum(p[0] for p in ll_pts) / len(ll_pts), sum(p[1] for p in ll_pts) / len(ll_pts))
         src = np.array([_metric(x, y, origin) for x, y in ll_pts], np.float32); dst = np.array(px_pts, np.float32)
-        H, mask = cv2.findHomography(src, dst, cv2.RANSAC if ransac else 0, ransac or 3.0)
-        if H is None: return None
+        if len(src) < 3 or len(src) != len(dst): return None
+        try:
+            if len(src) == 3:      # triangle lot: a homography needs 4 points, so use the exact affine through the 3 corners
+                H = np.vstack([cv2.getAffineTransform(src, dst), [0, 0, 1]]).astype(np.float64)
+            else:
+                H, mask = cv2.findHomography(src, dst, cv2.RANSAC if ransac else 0, ransac or 3.0)
+        except cv2.error:
+            return None
+        if H is None or abs(np.linalg.det(H)) < 1e-12: return None
         proj = cv2.perspectiveTransform(src.reshape(-1, 1, 2), H).reshape(-1, 2)
         err = float(np.mean(np.linalg.norm(proj - dst, axis=1)))
         return cls(H, origin, W, H_px, err)
