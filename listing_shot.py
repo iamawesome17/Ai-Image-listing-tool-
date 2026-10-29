@@ -24,7 +24,7 @@ Outputs (PNG): cover_4x3.png (1280×960), tight.png, wide.png (1280×1280), clea
 import argparse, json, math, os, sys, io, urllib.parse, urllib.request
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageColor
 from shapely.geometry import shape, Polygon, MultiPolygon, Point
 from shapely.ops import unary_union
 
@@ -291,20 +291,91 @@ def font(size, bold=True):
 SHADOWS = True      # layout.render() sets this from layout["style"]["shadow"]; False = crisp (no blurred drop shadows anywhere)
 
 
+class AADraw:
+    """Anti-aliased stand-in for ImageDraw.Draw on RGBA images (lines, ellipses, polygons, rounded boxes).
+    Each shape is drawn at AA× into a coverage mask over its own bounding box, box-filtered down, then composited 'over'
+    the image — smooth edges instead of stair-steps. Text / textlength pass straight through (Pillow text is already smooth)."""
+
+    def __init__(self, img):
+        self.img = img; self._d = ImageDraw.Draw(img)
+        # On an opaque photo the old ImageDraw replaced pixels, so a fill like (10,10,10,150) came out solid once saved as JPEG.
+        # Keep that look: fill alpha only matters on transparent layers (shadows, overlays).
+        self.opaque = img.getextrema()[3][0] == 255
+
+    def __getattr__(self, k):
+        return getattr(self._d, k)
+
+    @staticmethod
+    def _pts(xy):
+        xy = list(xy)
+        if xy and not isinstance(xy[0], (tuple, list)): xy = list(zip(xy[0::2], xy[1::2]))
+        return [(float(x), float(y)) for x, y in xy]
+
+    def _paint(self, pts, pad, fill, fn):
+        if fill is None or not pts: return
+        W, H = self.img.size
+        x0 = max(0, int(math.floor(min(p[0] for p in pts) - pad)) - 2); y0 = max(0, int(math.floor(min(p[1] for p in pts) - pad)) - 2)
+        x1 = min(W, int(math.ceil(max(p[0] for p in pts) + pad)) + 2); y1 = min(H, int(math.ceil(max(p[1] for p in pts) + pad)) + 2)
+        if x1 <= x0 or y1 <= y0: return
+        w, h = x1 - x0, y1 - y0
+        k = 4 if w * h <= 1_500_000 else 3 if w * h <= 4_000_000 else 2                 # cap memory on big outlines
+        m = Image.new("L", (w * k, h * k), 0)
+        fn(ImageDraw.Draw(m), lambda q: [((x - x0) * k, (y - y0) * k) for x, y in q], k)
+        m = m.reduce(k)
+        fill = tuple(fill) if isinstance(fill, (tuple, list)) else ImageColor.getcolor(fill, "RGBA")
+        a = 255 if self.opaque or len(fill) < 4 else fill[3]
+        if a < 255: m = m.point(lambda v: v * a // 255)
+        layer = Image.new("RGBA", (w, h), tuple(fill[:3]) + (0,)); layer.putalpha(m)
+        self.img.alpha_composite(layer, (x0, y0))
+
+    def line(self, xy, fill=None, width=1, joint=None):
+        pts = self._pts(xy); r = max(1.0, width / 2.0)
+        def fn(d, S, k):
+            q = S(pts); d.line(q, fill=255, width=max(1, int(round(width * k))), joint=joint)
+            if len(q) >= 2 and q[0] != q[-1]:                                         # round caps: no square stubs at open ends
+                for cx, cy in (q[0], q[-1]): d.ellipse((cx - r * k, cy - r * k, cx + r * k, cy + r * k), fill=255)
+        self._paint(pts, width, fill, fn)
+
+    def ellipse(self, xy, fill=None, outline=None, width=1):
+        pts = self._pts(xy)
+        self._paint(pts, 1, fill, lambda d, S, k: d.ellipse([c for p in S(pts) for c in p], fill=255))
+        if outline is not None:
+            self._paint(pts, width, outline, lambda d, S, k: d.ellipse([c for p in S(pts) for c in p], outline=255, width=max(1, int(width * k))))
+
+    def polygon(self, xy, fill=None, outline=None, width=1):
+        pts = self._pts(xy)
+        self._paint(pts, 1, fill, lambda d, S, k: d.polygon(S(pts), fill=255))
+        if outline is not None: self.line(pts + [pts[0]], fill=outline, width=width, joint="curve")
+
+    def rounded_rectangle(self, xy, radius=0, fill=None, outline=None, width=1):
+        pts = self._pts(xy)
+        self._paint(pts, 1, fill, lambda d, S, k: d.rounded_rectangle([c for p in S(pts) for c in p], radius=radius * k, fill=255))
+        if outline is not None:
+            self._paint(pts, width, outline, lambda d, S, k: d.rounded_rectangle([c for p in S(pts) for c in p], radius=radius * k, outline=255, width=max(1, int(width * k))))
+
+    def rectangle(self, xy, fill=None, outline=None, width=1):
+        self.rounded_rectangle(xy, 0, fill, outline, width)
+
+
+def aadraw(img):
+    """AADraw for RGBA images; plain ImageDraw for masks and other modes."""
+    return AADraw(img) if img.mode == "RGBA" else ImageDraw.Draw(img)
+
+
 def shadowed(img, draw_fn, blur=6, offset=(0, 4), alpha=140):
     """Draw draw_fn onto a shadow layer, blur it, composite, then draw for real. With SHADOWS off only the real pass runs."""
     if SHADOWS:
         sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw_fn(ImageDraw.Draw(sh), (0, 0, 0, alpha), offset)
+        draw_fn(aadraw(sh), (0, 0, 0, alpha), offset)
         sh = sh.filter(ImageFilter.GaussianBlur(blur))
         img.alpha_composite(sh)
-    draw_fn(ImageDraw.Draw(img), None, (0, 0))
+    draw_fn(aadraw(img), None, (0, 0))
 
 
 def draw_outline(img, frame, poly, color=(255, 255, 255, 255), width=5, fill_alpha=34):
     pts = [frame.px(c[0], c[1]) for c in poly.exterior.coords]
     fill = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ImageDraw.Draw(fill).polygon(pts, fill=(255, 255, 255, fill_alpha))
+    aadraw(fill).polygon(pts, fill=(255, 255, 255, fill_alpha))
     img.alpha_composite(fill)
 
     def fn(d, shadow, off):
@@ -359,7 +430,7 @@ def draw_pin(img, xy, color=(220, 38, 38, 255), r=22):
         d.ellipse((x - r + off[0], y - 2 * r - r + off[1], x + r + off[0], y - r + off[1]), fill=c)
         d.polygon([(x - r * 0.75 + off[0], y - 1.5 * r + off[1]), (x + r * 0.75 + off[0], y - 1.5 * r + off[1]), (x + off[0], y + off[1])], fill=c)
     shadowed(img, fn, blur=6, offset=(0, 5), alpha=150)
-    ImageDraw.Draw(img).ellipse((x - r * 0.4, y - 2.4 * r, x + r * 0.4, y - 1.6 * r), fill=(255, 255, 255, 255))
+    aadraw(img).ellipse((x - r * 0.4, y - 2.4 * r, x + r * 0.4, y - 1.6 * r), fill=(255, 255, 255, 255))
 
 
 def draw_pole(img, top, bottom, width=5):
@@ -368,7 +439,7 @@ def draw_pole(img, top, bottom, width=5):
         d.line([(top[0] + off[0], top[1] + off[1]), (bottom[0] + off[0], bottom[1] + off[1])], fill=shadow or (255, 255, 255, 255), width=width)
         d.ellipse((bottom[0] - r + off[0], bottom[1] - r + off[1], bottom[0] + r + off[0], bottom[1] + r + off[1]), fill=shadow or (255, 255, 255, 255))
     if not SHADOWS:
-        d = ImageDraw.Draw(img)
+        d = aadraw(img)
         d.line([top, bottom], fill=(0, 0, 0, 120), width=width + 2)
         d.ellipse((bottom[0] - r - 1, bottom[1] - r - 1, bottom[0] + r + 1, bottom[1] + r + 1), fill=(0, 0, 0, 120))
     shadowed(img, fn, blur=4, offset=(0, 3), alpha=160)

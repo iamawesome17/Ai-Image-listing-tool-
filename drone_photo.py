@@ -8,8 +8,10 @@ Property line placement, in order of preference:
      projected onto the photo automatically (flat-ground pinhole model; good to a few metres at typical altitudes).
   2. --points: pixel corners clicked by the user in the web UI.
 
-Relight: the polygon is drawn as a thin magenta marker, the image model re-lights the photo as golden hour keeping the
-marker, the marker is detected, erased and redrawn as the styled outline (same approach as the AI renders).
+Relight (natural, default): the image model re-lights the clean photo, then light_transfer() keeps every real pixel and borrows
+only the smoothed light/colour change — golden hour without the AI look. 'dramatic' = the older full AI relight with a magenta
+marker that is detected, erased and redrawn as the styled outline.
+Magic eraser: magic_erase() removes text/logos already on a photo; only the changed spots are pasted back onto the original.
 """
 import argparse, json, math, re, sys, os, io
 from pathlib import Path
@@ -82,22 +84,136 @@ def hfov_deg(f35, W, H):
 
 
 # ---------- relight ----------
-def relight_golden(img, pts, ref_url=None):
-    """Draw the marker, send to the image model for a golden-hour relight, return the relit image (marker kept).
-    ref_url: optional public URL of an already-marked image (skips the upload)."""
+OUT_W = 2400        # drone photo output width (was 1600): sharper lines and room to crop for listings
+
+PROMPT_NATURAL = ("Re-light this exact aerial photograph as a believable late-afternoon golden hour, like an unedited photo a real "
+                  "drone pilot took about 45 minutes before sunset: warm low sunlight, gently warmer tones, soft natural shadows, "
+                  "clear sky with only a faint warm tint near the horizon. Subtle and realistic: no dramatic orange or pink sky, "
+                  "no sun disc, no lens flare, no glow, no haze, no HDR look, no oversaturation. Keep the framing, perspective, "
+                  "every road, tree, building and field exactly as they are; do not add, move or remove anything. No text, no watermark.")
+PROMPT_DRAMATIC = ("Re-light this exact aerial photograph as golden hour: low warm sunset light from the west, long soft shadows, warm "
+                   "glowing sky at the horizon, slightly richer colors. Keep the framing, perspective, every road, tree, building and "
+                   "field exactly as they are; do not add, move or remove anything. A thin magenta line is painted on the ground marking "
+                   "the property boundary; keep it exactly where it is, same color, unbroken, no glow. No text, no watermark.")
+PROMPT_ERASE = ("Remove every piece of text, caption, number, watermark, logo, arrow, outline, pin, sticker or other graphic that was "
+                "added on top of this aerial photograph, and fill each of those spots with what is naturally underneath (ground, grass, "
+                "trees, sky, road, water). Change nothing else at all: same framing, same lighting, same colors and the same fine detail "
+                "everywhere else. Do not add anything. No text, no watermark.")
+
+
+def grok_edit(img, prompt):
+    """One image edit on the Higgsfield grok model at 2k, original aspect ratio. Returns an RGB image the size of img."""
+    url = dr.hf_upload_png(img.convert("RGB"))
+    saved = dict(dr.MODELS["grok"]["extra"]); dr.MODELS["grok"]["extra"] = {"resolution": "2k", "aspect_ratio": "auto", "quality": "medium"}
+    try:
+        job = dr.hf_submit("grok", prompt, url); res = dr.hf_wait_all({"edit": job})["edit"]
+    finally:
+        dr.MODELS["grok"]["extra"] = saved
+    if res.get("status") != "completed":
+        raise RuntimeError(f"image edit failed: {res.get('error')}")
+    out = dr.download(res["images"][0]["url"]).convert("RGB")
+    return out.resize(img.size, Image.LANCZOS) if out.size != img.size else out
+
+
+def align_to(ref, img):
+    """Warp img onto ref (the model sometimes nudges the framing a few pixels). Falls back to img unchanged."""
+    try:
+        a = np.array(ref.convert("L")); b = np.array(img.convert("L"))
+        k = 1024 / max(a.shape); sa = cv2.resize(a, None, fx=k, fy=k); sb = cv2.resize(b, None, fx=k, fy=k)
+        orb = cv2.ORB_create(4000); ka, da = orb.detectAndCompute(sa, None); kb, db = orb.detectAndCompute(sb, None)
+        if da is None or db is None: return img
+        m = sorted(cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(db, da), key=lambda x: x.distance)[:600]
+        if len(m) < 40: return img
+        src = np.float32([kb[x.queryIdx].pt for x in m]) / k; dst = np.float32([ka[x.trainIdx].pt for x in m]) / k
+        H, inl = cv2.findHomography(src, dst, cv2.RANSAC, 4.0)
+        if H is None or inl.sum() < 30: return img
+        if np.abs(H[:2, :2] - np.eye(2)).max() > 0.08 or np.abs(H[:2, 2]).max() > 0.06 * max(a.shape): return img   # not a small nudge: leave it
+        w = cv2.warpPerspective(np.array(img.convert("RGB")), H, (a.shape[1], a.shape[0]), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
+        return Image.fromarray(w)
+    except Exception:
+        return img
+
+
+def _guided(I, p, r, eps):
+    """Edge-aware smoothing of p guided by I (He et al. guided filter, box-filter form)."""
+    box = lambda x: cv2.boxFilter(x, -1, (2 * r + 1, 2 * r + 1))
+    mI, mp = box(I), box(p); a = (box(I * p) - mI * mp) / (box(I * I) - mI * mI + eps); b = mp - a * mI
+    return box(a) * I + box(b)
+
+
+def light_transfer(orig, ai, strength=0.85):
+    """Keep every real pixel of the photo and borrow only the LIGHT from the AI relight: the per-pixel colour/brightness change
+    (AI − original, in Lab) is smoothed edge-aware so the model's invented texture, smearing and over-sharpening are dropped,
+    then applied to the original at `strength`. Result: real detail, golden-hour light, no 'AI look'."""
+    ai = align_to(orig, ai)
+    o = cv2.cvtColor(np.array(orig.convert("RGB")), cv2.COLOR_RGB2LAB).astype(np.float32)
+    a = cv2.cvtColor(np.array(ai.convert("RGB")), cv2.COLOR_RGB2LAB).astype(np.float32)
+    H, W = o.shape[:2]; k = min(1.0, 1200 / W)                                       # work at ≤1200 px wide, upsample the smooth field
+    so = cv2.resize(o, None, fx=k, fy=k, interpolation=cv2.INTER_AREA); sa = cv2.resize(a, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    guide = so[..., 0] / 255.0; r = max(4, int(so.shape[1] / 60))
+    delta = np.dstack([_guided(guide, (sa[..., c] - so[..., c]) / 255.0, r, 2e-3) * 255.0 for c in range(3)])
+    delta = cv2.resize(delta, (W, H), interpolation=cv2.INTER_CUBIC)
+    # safety rails: even if the model overdoes it, the photo can only move so far toward warm (Lab units, 255 scale)
+    delta[..., 0] = np.clip(delta[..., 0], -16, 12) * strength                       # brightness
+    delta[..., 1] = np.clip(delta[..., 1], -6, 8) * strength                         # green ↔ red/magenta
+    delta[..., 2] = np.clip(delta[..., 2], -8, 14) * strength                        # blue ↔ yellow (the 'golden')
+    out = np.clip(o + delta, 0, 255).astype(np.uint8)
+    return Image.fromarray(cv2.cvtColor(out, cv2.COLOR_LAB2RGB))
+
+
+def relight_golden(img, pts, ref_url=None, style="natural"):
+    """Golden-hour version of the photo.
+    natural (default): AI relight of the clean photo, then light_transfer → original detail, believable warm light.
+    dramatic: the previous full AI relight with the boundary marker (kept for anyone who wants the big sunset)."""
+    if style != "dramatic":
+        base = img.convert("RGB")
+        return light_transfer(base, grok_edit(base, PROMPT_NATURAL)).convert("RGBA")
     marked = img.copy(); d = ImageDraw.Draw(marked)
     d.line(pts + [pts[0]], fill=P.FIDUCIAL + (255,), width=max(4, img.width // 300), joint="curve")
-    url = ref_url or dr.hf_upload_png(marked.convert("RGB"))
-    prompt = ("Re-light this exact aerial photograph as golden hour: low warm sunset light from the west, long soft shadows, warm "
-              "glowing sky at the horizon, slightly richer colors. Keep the framing, perspective, every road, tree, building and "
-              "field exactly as they are; do not add, move or remove anything. A thin magenta line is painted on the ground marking "
-              "the property boundary; keep it exactly where it is, same color, unbroken, no glow. No text, no watermark.")
-    saved = dict(dr.MODELS["grok"]["extra"]); dr.MODELS["grok"]["extra"] = {"resolution": "2k", "aspect_ratio": "auto", "quality": "medium"}
-    job = dr.hf_submit("grok", prompt, url); res = dr.hf_wait_all({"relight": job})["relight"]
-    dr.MODELS["grok"]["extra"] = saved
-    if res.get("status") != "completed":
-        raise RuntimeError(f"relight failed: {res.get('error')}")
-    return dr.download(res["images"][0]["url"])
+    if ref_url:
+        url = ref_url
+        saved = dict(dr.MODELS["grok"]["extra"]); dr.MODELS["grok"]["extra"] = {"resolution": "2k", "aspect_ratio": "auto", "quality": "medium"}
+        try:
+            job = dr.hf_submit("grok", PROMPT_DRAMATIC, url); res = dr.hf_wait_all({"relight": job})["relight"]
+        finally:
+            dr.MODELS["grok"]["extra"] = saved
+        if res.get("status") != "completed": raise RuntimeError(f"relight failed: {res.get('error')}")
+        return dr.download(res["images"][0]["url"])
+    return grok_edit(marked, PROMPT_DRAMATIC).convert("RGBA")
+
+
+# ---------- magic eraser ----------
+def erase_mask(orig, ai):
+    """Where the AI actually removed something. Added text/logos change the LOCAL AVERAGE colour a lot; the model re-drawing tree
+    and grass texture does not — so compare blurred images, with a threshold set from the image's own background noise.
+    Returns a 0..1 float mask, feathered."""
+    o = cv2.cvtColor(np.array(orig.convert("RGB")), cv2.COLOR_RGB2LAB).astype(np.float32)
+    a = cv2.cvtColor(np.array(ai.convert("RGB")), cv2.COLOR_RGB2LAB).astype(np.float32)
+    a = (a - a.mean((0, 1))) / (a.std((0, 1)) + 1e-6) * o.std((0, 1)) + o.mean((0, 1))   # cancel any global tone shift
+    H, W = o.shape[:2]; s = max(1.0, W / 1600)
+    d = np.abs(cv2.GaussianBlur(a, (0, 0), 3.0 * s) - cv2.GaussianBlur(o, (0, 0), 3.0 * s))
+    diff = np.maximum(d[..., 0], 0.9 * np.maximum(d[..., 1], d[..., 2]))
+    med = float(np.median(diff)); mad = float(np.median(np.abs(diff - med))) + 1e-3
+    m = (diff > max(12.0, med + 8 * 1.4826 * mad)).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(5 * s) | 1,) * 2))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m)
+    keep = np.zeros_like(m)
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] >= 120 * s * s: keep[lab == i] = 1               # drop small blobs from re-drawn texture
+    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(11 * s) | 1,) * 2))
+    return np.clip(cv2.GaussianBlur(keep.astype(np.float32), (0, 0), 2.5 * s), 0, 1)
+
+
+def magic_erase(src_path, out_path, max_w=OUT_W):
+    """Remove text / logos / graphics someone already put on a photo. The AI paints the cleaned version; only the spots it changed
+    are copied back onto the original, so everything else stays pixel-identical. Returns (out_path, share of image changed)."""
+    img = ImageOps.exif_transpose(Image.open(src_path)).convert("RGB")
+    if img.width > max_w: img = img.resize((max_w, round(img.height * max_w / img.width)), Image.LANCZOS)
+    ai = align_to(img, grok_edit(img, PROMPT_ERASE))
+    m = erase_mask(img, ai)[..., None]
+    out = (np.array(img, np.float32) * (1 - m) + np.array(ai, np.float32) * m).clip(0, 255).astype(np.uint8)
+    Image.fromarray(out).save(out_path, quality=95)
+    return str(out_path), float(m.mean())
 
 
 # ---------- main ----------
@@ -171,17 +287,19 @@ def L_metric(pm, lon, lat):
     return L._metric(lon, lat, pm.origin)
 
 
-def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref_url=None, meta_path=None):
+def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref_url=None, meta_path=None, pts_size=None):
     """Annotate a real drone photo: writes an editable run folder (clean images + maps.json + layout.json) and draws the outputs
     through pipeline.finalize, so the web editor can adjust everything afterwards."""
     import layout as L
     img = ImageOps.exif_transpose(Image.open(photo_path)).convert("RGBA")
     meta = read_metadata(meta_path or photo_path)
     source = "manual corners"
+    if pts and pts_size and pts_size[0] and pts_size[0] != img.width:                  # corners clicked on the smaller preview copy
+        k = img.width / pts_size[0]; pts = [(x * k, y * k) for x, y in pts]
     if pts is None and meta:
         pts = project_polygon(meta, parcel["polygon"], img.width, img.height); source = "DJI metadata projection"
-    if img.width > 1600:
-        k = 1600 / img.width; img = img.resize((1600, round(img.height * k)), Image.LANCZOS)
+    if img.width > OUT_W:
+        k = OUT_W / img.width; img = img.resize((OUT_W, round(img.height * k)), Image.LANCZOS)
         if pts: pts = [(x * k, y * k) for x, y in pts]
     stem = Path(photo_path).stem.replace("_work", "")
     out_dir = Path(out_dir or f"out/{parcel['apn']}/photos") / stem; out_dir.mkdir(parents=True, exist_ok=True)
@@ -214,9 +332,10 @@ def annotate(photo_path, parcel, scan, pts=None, golden=False, out_dir=None, ref
     maps["photo_original"] = {"src": "photo_original_clean.jpg", "kind": "photo", "boundary_px": [list(p) for p in pts], "map": pm.to_json() if pm else None,
                               "source": source, "fit": fit_note, "meta": meta, "rough": rough}
     if golden:
-        relit = relight_golden(img, pts, ref_url)
+        style = golden if isinstance(golden, str) else "natural"
+        relit = relight_golden(img, pts, ref_url, style)
         if relit.size != img.size: relit = relit.resize(img.size, Image.LANCZOS)
-        det, q = P.detect_fiducial(relit)
+        det, q = P.detect_fiducial(relit) if style == "dramatic" else (None, None)    # natural: same pixels as the original, no marker
         if det:
             clean, _ = P.erase_markers(relit, q.get("_mask"), [], [], dilate=3, radius=3); relit_pts = det   # thin marker: repaint only its own pixels (no smear band)
             if pm:   # the relit image is the same frame: keep the same map; the marker only confirms the line survived

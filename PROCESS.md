@@ -143,8 +143,22 @@ Puts the true property line (and the acreage card, road labels, disclaimer) on a
    (4+ clicks → the parcel shape is matched to the clicks and the true outline with every jog is drawn), or just press Annotate: the true parcel shape is
    placed in the middle and you **drag its corners** onto the real corners in Review & edit — 4 moved corners are enough, the rest snap into place and the
    callouts appear (validated at 1.8 px on a synthetic frame).
-2. Golden hour: the polygon is drawn as a thin magenta marker, Grok re-lights the photo keeping the marker, the marker is detected, erased (inpaint with a 3-px dilation — the earlier 7-px band showed as a smear along the line) and redrawn as the styled line.
+2. Golden hour (picker: Natural / Dramatic / none):
+   - **Natural (default, Oct 29 2026)**: Grok re-lights the clean photo with a deliberately subtle prompt (PROMPT_NATURAL), then
+     `light_transfer()` keeps every real pixel and borrows only the light: the Lab change (AI − original) is aligned (ORB homography),
+     smoothed with an edge-aware guided filter (drops the model's invented texture/smear, keeps the horizon edge sharp) and applied at
+     0.85 strength with hard caps (L −16..+12, a −6..+8, b −8..+14) so an over-the-top AI result can never push the photo past believable.
+     No marker needed — the output is the same pixel frame as the original.
+   - **Dramatic**: the older full AI relight. The polygon is drawn as a thin magenta marker, Grok re-lights the photo keeping it, the marker is detected, erased (3-px inpaint) and redrawn as the styled line.
    Outputs: `<photo>_original_with_lines.jpg`, `<photo>_golden_with_lines.jpg`, `<photo>_golden_no_lines.jpg`.
+3. Magic eraser (button above the photo, ≈ $0.05): for photos that arrive with text, phone numbers or logos baked in. Grok paints a
+   cleaned version (PROMPT_ERASE); `erase_mask()` finds where it actually removed something by comparing *blurred* Lab images after
+   cancelling any global tone shift, with a threshold from the image's own noise (median + 8·MAD) — the model re-drawing tree texture
+   does not trip it, overlays do (tested: 99.9 % of overlay pixels caught, 7 % of the image touched for 4.9 % of text). Only those
+   feathered spots are pasted onto the original; everything else stays pixel-identical. Repeatable; **Undo eraser** returns to the upload.
+   DJI metadata is always read from the original upload, so automatic line placement still works on an erased photo.
+4. Resolution: corners are clicked on a 1600-px preview, but the outputs are drawn on the full photo capped at 2400 px wide
+   (`drone_photo.OUT_W`, was 1600); clicked corners are scaled up (`annotate(pts_size=…)`).
 Camera: DJI Mini 2 (24 mm equiv, 4:3) is the reference; any DJI with the same tags works.
 
 ## Hosting (so the team runs it without anyone's laptop)
@@ -182,6 +196,10 @@ or push packets to a Drive/Dropbox folder (next improvement).
 | Regrid lookup (where used) | $0.05–0.10 |
 
 ## Known limits / next improvements
+
+- Oct 29 2026: lines/pins/cards are drawn anti-aliased (`listing_shot.AADraw`: each shape rasterised at 2–4× over its own bounding box,
+  box-filtered down, composited). On opaque photos fill alpha is treated as 255 so cards and callouts look exactly as before, just smooth.
+  Golden-hour wording for the AI packet views was toned down to the same "believable late afternoon" prompt.
 
 - Oct 29 2026: McNairy Co, TN failed every route (no TN source; Realie ignores coordinates). Fixed: built-in `tn` source, County box shown for statewide sources, Realie + coordinates now gives a clear message instead of a dead end.
 - Counties added in the app's Counties tab are lost on every Railway redeploy until a volume is mounted at /app/data (Railway → service → Settings → Volumes → mount path `/app/data`). Built-in sources in counties.json are not affected.

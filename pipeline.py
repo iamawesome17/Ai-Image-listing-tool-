@@ -648,7 +648,10 @@ def rotated_reference(frame_sq, poly, angle_deg, roads=None, power=None):
 def prompt_for(view, light, desc, forbid, roads=None, power=None):
     close = view.endswith("_close"); low = view.endswith("_low"); view = view.split("_")[0]
     lightw = {"day": "bright midday sunlight, clear blue sky, natural colors",
-              "golden": "golden hour, low warm sunset light from the west, long soft shadows, warm sky at the horizon"}[light]
+              "golden": ("believable late-afternoon golden hour about 45 minutes before sunset: warm low sun from the west, soft natural "
+                         "shadows, gently warm tones, clear sky with only a faint warm tint near the horizon. Subtle and realistic like an "
+                         "unedited drone photo: no dramatic orange or pink sky, no sun disc, no lens flare, no glow, no haze, no HDR look, "
+                         "no oversaturation")}[light]
     scene = f"Scene facts (keep them true): {desc} " + "; ".join(forbid) + "."
     fid = ("A thin magenta line is painted on the ground marking the property boundary" + (", and a thin cyan line is painted along the "
            "centerline of the nearby road" if roads else "") + (", and a thin orange line follows the overhead power line" if power else "") +

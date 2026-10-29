@@ -238,7 +238,7 @@ def _crisp(img, pts, width, closed=True, shadow=False):
     def fn(d, sh, off):
         d.line([(x + off[0], y + off[1]) for x, y in q], fill=sh or (255, 255, 255, 255), width=width, joint="curve")
     if shadow: ls.shadowed(img, fn, blur=4, offset=(0, 2), alpha=170)
-    d = ImageDraw.Draw(img)
+    d = ls.aadraw(img)
     d.line(q, fill=(0, 0, 0, 120), width=width + 2, joint="curve")
     d.line(q, fill=(255, 255, 255, 255), width=width, joint="curve")
 
@@ -319,7 +319,7 @@ def draw_road(img, xy, lb, scale):
     ls.draw_pin(img, (x, y), r=int(14 * k))
     if mode == "top" or abs(bx - x) > 20 * k:                       # label not directly above the pin: thin leader
         end = (bx, box[3] + 2) if mode == "bottom" else (bx, box[1] - 2)
-        ImageDraw.Draw(img).line([(x, y - 14 * k), end], fill=(255, 255, 255, 220), width=max(2, int(2 * k)))
+        ls.aadraw(img).line([(x, y - 14 * k), end], fill=(255, 255, 255, 220), width=max(2, int(2 * k)))
     ls.text_box(img, (bx, by), lines, sizes, pad=pad, radius=int(9 * k), anchor=mode, bg=ROAD_STYLE["bg"], fg=ROAD_STYLE["fg"])
     PLACEMENT[lb.get("id", text)] = {"x": x, "y": y, "bx": bx, "by": by, "mode": mode, "box": list(box)}
 
@@ -354,7 +354,7 @@ def render(img, gmap, layout, parcel, pois=(), boundary_px=None, show_card=True,
         PLACEMENT["boundary"] = {"px": [list(p) for p in pts], "visible": bool(st.get("line_visible", True)), "line_scale": st.get("line_scale", 1.0)}
         if st.get("line_visible", True) and len(pts) >= 2:
             if st.get("fill", True) and len(pts) >= 3:
-                fill = Image.new("RGBA", out.size, (0, 0, 0, 0)); ImageDraw.Draw(fill).polygon(pts, fill=(255, 255, 255, 34)); out.alpha_composite(fill)
+                fill = Image.new("RGBA", out.size, (0, 0, 0, 0)); ls.aadraw(fill).polygon(pts, fill=(255, 255, 255, 34)); out.alpha_composite(fill)
             _crisp(out, pts, max(2, int(round(5 * scale * float(st.get("line_scale", 1.0) or 1.0)))), closed=len(pts) >= 3, shadow=ls.SHADOWS)
         if show_card and layout["card"].get("visible", True): draw_card(out, gmap, layout, parcel, scale)
         if len(pts) >= 2:

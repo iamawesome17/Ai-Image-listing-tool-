@@ -240,7 +240,7 @@ def make_work_copy(path):
 
 def photo_uploaded(path):
     import drone_photo as D
-    if not path: return None, None, [], "", None
+    if not path: return None, None, [], "", None, None
     meta = D.read_metadata(path)
     work = make_work_copy(path)
     if meta:
@@ -248,7 +248,33 @@ def photo_uploaded(path):
     else:
         tags = D.metadata_debug(path)
         msg = "ℹ️ No usable drone metadata in this file — click the parcel corners on the photo, in order around the boundary." + (f"  (found: {tags})" if tags else "  (no EXIF/XMP at all — the file was probably re-saved by a photo app)")
-    return path, work, [], msg, work
+    return path, work, [], msg, work, path
+
+
+def erase_photo(orig, src, progress=gr.Progress()):
+    """Magic eraser: remove text / logos already on the photo. Only the spots the AI changed are pasted back; the rest of the
+    photo stays pixel-for-pixel. Drone metadata keeps coming from the original upload."""
+    import drone_photo as D
+    if not (src or orig): raise gr.Error("Upload a drone photo first.")
+    src = src or orig
+    progress(0.2, desc="Removing text & logos (≈ 30–60 s)…")
+    out = Path(src).with_name(Path(src).stem.replace("_erased", "") + "_erased.jpg")
+    try:
+        out, share = D.magic_erase(src, out)
+    except Exception as e:
+        raise gr.Error(f"Magic eraser failed: {str(e)[:200]}")
+    work = make_work_copy(out)
+    note = (f"✨ **Magic eraser done** — cleaned {share * 100:.0f}% of the photo; everything else is untouched. "
+            "Run it again if anything is left, or **Undo eraser** to go back. Then annotate as usual.")
+    if share > 0.35: note += " ⚠️ That's a big share — check the result closely before using it."
+    if share < 0.002: note = "ℹ️ The eraser found nothing to remove on this photo."
+    return out, work, [], note, work
+
+
+def undo_erase(orig):
+    if not orig: raise gr.Error("Upload a drone photo first.")
+    work = make_work_copy(orig)
+    return orig, work, [], "Back to the original upload.", work
 
 
 def photo_click(path, pts, evt: gr.SelectData):
@@ -304,7 +330,7 @@ def scan_for(parcel, cfg):
     return P.scan_surroundings(cfg, parcel, ls.fetch_satellite(fr), fr) if cfg.get("scan") == "county" else P.scan_federal(fed, cfg, parcel, ls.fetch_satellite(fr), fr)
 
 
-def run_photo(path, work, source, county_label, pin, lot, boundary, label, acres_txt, golden, pts, rstate="", rcounty="", progress=gr.Progress()):
+def run_photo(path, work, source, county_label, pin, lot, boundary, label, acres_txt, golden, pts, rstate="", rcounty="", src=None, progress=gr.Progress()):
     import drone_photo as D, listing_shot as ls, pipeline as P
     from shapely.geometry import Polygon
     if not path: raise gr.Error("Upload a drone photo first.")
@@ -328,9 +354,11 @@ def run_photo(path, work, source, county_label, pin, lot, boundary, label, acres
         except Exception as e:
             scan = None; scan_err = str(e)[:200]
     points = [tuple(p) for p in pts] if pts and len(pts) >= 3 else None
-    progress(0.4, desc="Golden-hour relight (≈1 min)…" if golden else "Drawing lines…")
+    style = "dramatic" if str(golden).startswith("Dramatic") else ("natural" if str(golden).startswith("Natural") or golden is True else False)
+    src = src or path; psize = _load(work).size if (points and work) else None      # corners were clicked on the preview copy
+    progress(0.4, desc="Golden-hour relight (≈1 min)…" if style else "Drawing lines…")
     try:
-        r = D.annotate(work or path, parcel, scan, points, golden, out_dir=HERE / "out" / re.sub(r"[^A-Za-z0-9_.-]+", "_", str(parcel["apn"])) / "photos", meta_path=path)
+        r = D.annotate(src or work, parcel, scan, points, style, pts_size=psize, out_dir=HERE / "out" / re.sub(r"[^A-Za-z0-9_.-]+", "_", str(parcel["apn"])) / "photos", meta_path=path)
     except RuntimeError as e:
         raise gr.Error(str(e))
     note = f"Property line from **{r['source']}**."
@@ -555,6 +583,9 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                 with gr.Column(scale=1, min_width=320):
                     gr.Markdown("### Photo")
                     photo = gr.Image(type="filepath", label="Drone photo", height=320, sources=["upload"])
+                    with gr.Row():
+                        perase = gr.Button("✨ Magic eraser — remove text & logos (≈ $0.05)", size="sm", scale=3)
+                        pundo = gr.Button("Undo eraser", size="sm", scale=1)
                     pstatus = gr.Markdown('<div class="help">Straight from the SD card = the line is placed automatically from the drone GPS. Otherwise press <b>Annotate</b> and drag the corners into place in <b>Review &amp; edit</b> below.</div>')
                     gr.Markdown("### Property line from")
                     psource = gr.Radio(["Parcel number", "Saved lot (subdivision)", "Draw on the photo (no parcel)"], value="Parcel number", show_label=False)
@@ -571,7 +602,8 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     with gr.Group(visible=False) as pg_draw:
                         pacres = gr.Textbox(label="Acreage for the card (optional)", placeholder="10.5")
                     plabel = gr.Textbox(label="Name / address for the card (optional)", placeholder="PRE Lot 7")
-                    pgolden = gr.Checkbox(value=True, label="Add a golden-hour version (≈ $0.05)")
+                    pgolden = gr.Radio(["Natural golden hour (recommended)", "Dramatic sunset", "No golden hour"], value="Natural golden hour (recommended)",
+                                       label="Golden-hour version (≈ $0.05)")
                     pgo = gr.Button("Annotate photo", variant="primary", size="lg")
                     pclear = gr.Button("Clear clicked corners", size="sm")
                     pnote = gr.Markdown()
@@ -579,11 +611,13 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     edit_btn3 = gr.Button("Open in Review & edit →", size="sm")
                 with gr.Column(scale=2):
                     pgallery = gr.Gallery(label="Results", columns=2, height=640, object_fit="contain", show_label=False)
-            pts_state = gr.State([]); orig_state = gr.State(None); work_state = gr.State(None)
-            photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo])
+            pts_state = gr.State([]); orig_state = gr.State(None); work_state = gr.State(None); src_state = gr.State(None)
+            photo.upload(photo_uploaded, [photo], [orig_state, work_state, pts_state, pstatus, photo, src_state])
+            perase.click(erase_photo, [orig_state, src_state], [src_state, work_state, pts_state, pstatus, photo])
+            pundo.click(undo_erase, [orig_state], [src_state, work_state, pts_state, pstatus, photo])
             photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
             pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
-            photo_evt = pgo.click(run_photo, [orig_state, work_state, psource, pcounty, ppin, plot, pboundary, plabel, pacres, pgolden, pts_state, prstate, prcounty], [pgallery, pnote, run_dir, pzip])
+            photo_evt = pgo.click(run_photo, [orig_state, work_state, psource, pcounty, ppin, plot, pboundary, plabel, pacres, pgolden, pts_state, prstate, prcounty, src_state], [pgallery, pnote, run_dir, pzip])
             pcounty.change(_src_rows, [pcounty], [prealie_row, prstate])
             psource.change(lambda v: (gr.update(visible=v.startswith("Parcel")), gr.update(visible=v.startswith("Saved")), gr.update(visible=v.startswith("Draw"))), [psource], [pg_parcel, pg_lot, pg_draw])
             plrefresh.click(lambda: gr.update(choices=lots.list_lots()), None, [plot])
