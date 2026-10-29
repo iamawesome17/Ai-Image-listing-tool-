@@ -171,6 +171,7 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, rende
         cmd += ["--boundary", boundary] + (["--label", label] if label else [])
     elif COUNTIES[county].get("kind") == "realie":
         st = (rstate or "").split(" ")[0].strip().upper(); cn = (rcounty or "").strip()
+        if not pin and lat and lon: raise gr.Error(REALIE_COORDS)
         if not st: raise gr.Error("Realie needs the state (and county for a parcel number).")
         looks_addr = bool(re.match(r"^\s*\d+\s+[A-Za-z]", pin))
         cmd += ["--state", st] + (["--county-name", cn] if cn else []) + (["--address", pin] if looks_addr else ["--pin", pin])
@@ -179,6 +180,7 @@ def run(county_label, pin, lat, lon, boundary, label, angles, lights, low, rende
         cmd += ["--address", pin]                      # Regrid: a street address works best
     else:
         cmd += ["--pin", pin] if pin else ["--lat", str(lat), "--lon", str(lon)]
+        if (rcounty or "").strip(): cmd += ["--county-name", rcounty.strip()]
     if not render: cmd.append("--no-render")
     progress(0.05, desc="Parcel + surroundings scan…")
     t0 = time.time()
@@ -258,6 +260,10 @@ def photo_clear(path):
     return [], (_load(path) if path else None), "Corners cleared"
 
 
+REALIE_COORDS = ("Coordinates don't work with the Realie option. Pick the state's own source in the County / state list "
+                 "(e.g. Tennessee (statewide)) for a lat/long, or give Realie a parcel number + county or a street address.")
+
+
 def resolve_parcel(county_label, pin, boundary=None, label="", rstate="", rcounty="", lat=None, lon=None):
     """Parcel dict from any source: boundary file / saved lot, Realie, Regrid, county or statewide layer, or lat/lon."""
     import listing_shot as ls, pipeline as P
@@ -276,6 +282,7 @@ def resolve_parcel(county_label, pin, boundary=None, label="", rstate="", rcount
     if cfg.get("kind") == "realie":
         st = (rstate or "").split(" ")[0].strip().upper(); cn = (rcounty or "").strip()
         looks_addr = bool(re.match(r"^\s*\d+\s+[A-Za-z]", pin))
+        if not pin: raise gr.Error(REALIE_COORDS)
         try:
             return P.fetch_parcel_realie(None if looks_addr else pin, st, cn, pin if looks_addr else None), cfg
         except SystemExit as e:
@@ -284,7 +291,7 @@ def resolve_parcel(county_label, pin, boundary=None, label="", rstate="", rcount
         return ls.fetch_parcel(pin, None, pin if ("," in pin or " " in pin) else None, lat, lon), cfg
     if not pin and not (lat and lon): raise gr.Error("Enter a parcel number (or coordinates).")
     try:
-        return P.fetch_parcel_county(cfg, pin or None, lat if not pin else None, lon if not pin else None), cfg
+        return P.fetch_parcel_county(cfg, pin or None, lat if not pin else None, lon if not pin else None, (rcounty or "").strip() or None), cfg
     except SystemExit as e:
         raise gr.Error(str(e))
 
@@ -462,6 +469,12 @@ EDITOR_HTML = """
 </div>
 """
 
+def _src_rows(c):
+    """County box for Realie and statewide sources; the state picker only matters for Realie."""
+    c = c or ""; realie = "Realie" in c
+    return gr.update(visible=realie or "statewide" in c), gr.update(visible=realie)
+
+
 with gr.Blocks(title="Bana Listing Photos") as demo:
     import lots
     gr.HTML('<div id="hero"><h1>Bana Listing Photos</h1><p>Parcel or drawn lot in → listing-ready images out: true property lines on satellite and AI drone views, or on your own drone photos.</p></div>')
@@ -481,7 +494,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     lcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state of the mother parcel")
                     lpin = gr.Textbox(label="Mother parcel number — or a street address with the Realie option", placeholder="20-0-0636-002-00")
                     with gr.Row(visible=False) as lrealie_row:
-                        lrstate = gr.Dropdown(STATE_CHOICES, value="MO — Missouri", label="State (Realie)"); lrcounty = gr.Textbox(label="County (Realie)")
+                        lrstate = gr.Dropdown(STATE_CHOICES, value="MO — Missouri", label="State (Realie)"); lrcounty = gr.Textbox(label="County (Realie / statewide)")
                     with gr.Row():
                         llat = gr.Number(label="…or latitude", value=None); llon = gr.Number(label="longitude", value=None)
                     lopen = gr.Button("Open satellite & draw", variant="primary", size="lg")
@@ -502,7 +515,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     lgallery = gr.Gallery(label="Packet", columns=3, height=420, object_fit="cover", show_label=False)
                     with gr.Accordion("Run log", open=False):
                         llog = gr.Textbox(lines=10, show_label=False)
-            lcounty.change(lambda c: gr.update(visible=("Realie" in (c or ""))), [lcounty], [lrealie_row])
+            lcounty.change(_src_rows, [lcounty], [lrealie_row, lrstate])
 
         # ---------- 2. single parcel ----------
         with gr.Tab("Single parcel", id="gen"):
@@ -512,7 +525,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                     county = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state")
                     pin = gr.Textbox(label="Parcel number (PIN / APN) — or a street address with the Realie option", placeholder="20-0-0636-002-00")
                     with gr.Row(visible=False) as realie_row:
-                        rstate = gr.Dropdown(STATE_CHOICES, value="MO — Missouri", label="State (Realie)"); rcounty = gr.Textbox(label="County (Realie)", placeholder="Cass")
+                        rstate = gr.Dropdown(STATE_CHOICES, value="MO — Missouri", label="State (Realie)"); rcounty = gr.Textbox(label="County (Realie / statewide)", placeholder="Cass")
                     gr.Markdown('<div class="help">Parcel number as shown on the county assessor site. …or locate by coordinates:</div>')
                     with gr.Row():
                         lat = gr.Number(label="Latitude", value=None); lon = gr.Number(label="Longitude", value=None)
@@ -534,7 +547,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                         logbox = gr.Textbox(lines=14, show_label=False)
             run_evt = go.click(lambda c, p, la, lo, b, bl, a, l, lw, r, rs, rc: run(c, p, la, lo, b, bl, ",".join(a) or "S", ",".join(l) or "golden", lw.split(" ")[0], r, rs, rc),
                                [county, pin, lat, lon, boundary, blabel, angles, lights, lowv, render, rstate, rcounty], [gallery, zipf, summary, logbox, run_dir])
-            county.change(lambda c: gr.update(visible=("Realie" in (c or ""))), [county], [realie_row])
+            county.change(_src_rows, [county], [realie_row, rstate])
 
         # ---------- 3. drone photo ----------
         with gr.Tab("Drone photo", id="photo"):
@@ -549,7 +562,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
                         pcounty = gr.Dropdown(list(COUNTY_LABELS.values()), value=list(COUNTY_LABELS.values())[0], label="County / state")
                         ppin = gr.Textbox(label="Parcel number (PIN / APN) — or a street address with the Realie option", placeholder="20-0-0636-002-00")
                         with gr.Row(visible=False) as prealie_row:
-                            prstate = gr.Dropdown(STATE_CHOICES, value="MO — Missouri", label="State (Realie)"); prcounty = gr.Textbox(label="County (Realie)")
+                            prstate = gr.Dropdown(STATE_CHOICES, value="MO — Missouri", label="State (Realie)"); prcounty = gr.Textbox(label="County (Realie / statewide)")
                         with gr.Accordion("Or upload a boundary file (Land id export)", open=False):
                             pboundary = gr.File(label="KML, KMZ, GeoJSON or zipped Shapefile", file_types=[".kml", ".kmz", ".geojson", ".json", ".zip"], type="filepath")
                     with gr.Group(visible=False) as pg_lot:
@@ -571,7 +584,7 @@ with gr.Blocks(title="Bana Listing Photos") as demo:
             photo.select(photo_click, [work_state, pts_state], [pts_state, photo, pstatus])
             pclear.click(photo_clear, [work_state], [pts_state, photo, pstatus])
             photo_evt = pgo.click(run_photo, [orig_state, work_state, psource, pcounty, ppin, plot, pboundary, plabel, pacres, pgolden, pts_state, prstate, prcounty], [pgallery, pnote, run_dir, pzip])
-            pcounty.change(lambda c: gr.update(visible=("Realie" in (c or ""))), [pcounty], [prealie_row])
+            pcounty.change(_src_rows, [pcounty], [prealie_row, prstate])
             psource.change(lambda v: (gr.update(visible=v.startswith("Parcel")), gr.update(visible=v.startswith("Saved")), gr.update(visible=v.startswith("Draw"))), [psource], [pg_parcel, pg_lot, pg_draw])
             plrefresh.click(lambda: gr.update(choices=lots.list_lots()), None, [plot])
 

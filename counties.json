@@ -223,6 +223,27 @@
     },
     "reverse_geocode": true
   },
+  "tn": {
+    "name": "Tennessee (statewide)",
+    "kind": "arcgis",
+    "scan": "federal",
+    "statewide": true,
+    "parcels_url": "https://services1.arcgis.com/YuVBSS7Y1of2Qud1/arcgis/rest/services/Tennessee_Property_Boundaries_Public_Use/FeatureServer/0",
+    "_note": "TN Comptroller statewide parcels (all 95 counties incl. those not in TPAD). Same map+parcel repeats in every county -> pin_mode tn + County box.",
+    "pin_field": "PARCELID",
+    "pin_mode": "tn",
+    "pin_normalize": "loose",
+    "fields": {
+      "situs": "ADDRESS",
+      "acres": "DEEDAC",
+      "owner": "OWNER",
+      "county": "COUNTY_NAME"
+    },
+    "defaults": {
+      "state": "TN"
+    },
+    "reverse_geocode": true
+  },
   "cass-mo": {
     "name": "Cass County, MO",
     "kind": "camavision",

@@ -76,6 +76,39 @@ def pin_variants(pin, mode):
     return out
 
 
+def tn_parts(pin):
+    """Tennessee (Comptroller) parcel number → dict(county_id, map, group, parcel), or None.
+    Accepts what people actually type: '001 001.00', '001-001.00', '007C A 001.00', '055 001 00100 000', or the layer's own
+    PARCELID '055 001    00100 000 2026'. The same map + parcel exists in every TN county, so the county is matched separately."""
+    s = re.sub(r"\s+20\d{2}\s*$", "", (pin or "").upper().strip())          # trailing tax year
+    toks = [t for t in re.split(r"[\s\-_/,]+", s) if t]
+    if not toks: return None
+    pi = next((i for i in range(len(toks) - 1, -1, -1) if re.fullmatch(r"\d{1,3}\.\d{1,2}|\d{5}", toks[i])), None)
+    if pi is None:                                                             # e.g. '001 1' — last plain number is the parcel
+        pi = next((i for i in range(len(toks) - 1, 0, -1) if re.fullmatch(r"\d{1,3}", toks[i])), None)
+        if pi is None: return None
+    p = toks[pi]
+    if "." in p: a, b = p.split("."); parcel = f"{int(a):03d}.{b.ljust(2, '0')[:2]}"
+    elif len(p) == 5: parcel = f"{p[:3]}.{p[3:]}"
+    else: parcel = f"{int(p):03d}.00"
+    head = toks[:pi]
+    group = ""
+    if head and re.fullmatch(r"[A-Z]", head[-1]): group = head.pop()
+    if not head or not re.fullmatch(r"\d{1,3}[A-Z]?", head[-1]): return None
+    m = re.fullmatch(r"(\d{1,3})([A-Z]?)", head.pop()); cmap = f"{int(m.group(1)):03d}{m.group(2)}"
+    cid = int(head[-1]) if head and re.fullmatch(r"\d{3}", head[-1]) else None
+    return {"county_id": cid, "map": cmap, "group": group, "parcel": parcel}
+
+
+def _sq(v): return str(v).replace("'", "''")
+
+
+def tn_address(a):
+    """'SMITH LN 660' (assessor order) → '660 Smith Ln'."""
+    a = (a or "").strip(); m = re.fullmatch(r"(.+?)\s+(\d+[A-Z]?)", a)
+    return (f"{m.group(2)} {m.group(1)}" if m else a).title()
+
+
 def reverse_geocode(lat, lon):
     """city / county / zip from Google Geocoding (returns {} if the API is not enabled on the key)."""
     try:
@@ -198,13 +231,31 @@ def fetch_parcel_realie(pin=None, state=None, county=None, address=None, lat=Non
     return parcel
 
 
-def fetch_parcel_county(cfg, pin=None, lat=None, lon=None):
+def fetch_parcel_county(cfg, pin=None, lat=None, lon=None, county_name=None):
     """Parcel from a county or statewide ArcGIS parcel layer, normalized to the pipeline's parcel dict."""
     if cfg.get("kind") == "camavision":
         return fetch_parcel_camavision(cfg, pin, lat, lon)
     url = cfg.get("parcels_url") or f"{cfg['server']}/{cfg['layers']['parcels']}"
     F = cfg["fields"]; d = {}
-    if pin:
+    cn = re.sub(r"\s+county$", "", (county_name or "").strip(), flags=re.I)
+    if pin and cfg.get("pin_mode") == "tn":
+        tp = tn_parts(pin)
+        if not tp:
+            sys.exit(f"Could not read '{pin}' as a Tennessee parcel number. Use map + parcel as on the assessor card, e.g. 001 001.00 "
+                     "(or 007C A 001.00 with a group letter).")
+        w = f"CMAP='{tp['map']}' AND PARCEL='{tp['parcel']}' AND " + (f"GP='{tp['group']}'" if tp["group"] else "(GP=' ' OR GP='' OR GP IS NULL)")
+        if cn: w += f" AND UPPER(COUNTY_NAME)='{_sq(cn.upper())}'"
+        elif tp["county_id"]: w += f" AND COUNTY_ID={tp['county_id']}"
+        d = layer_query(url, {"where": w}, "parcel")
+        feats = d.get("features") or []
+        counties = sorted({(f["properties"].get("COUNTY_NAME") or "?") for f in feats})
+        if len(counties) > 1:
+            sys.exit(f"Parcel {tp['map']} {tp['group'] + ' ' if tp['group'] else ''}{tp['parcel']} exists in {len(counties)} Tennessee counties "
+                     f"({', '.join(counties[:8])}{'…' if len(counties) > 8 else ''}). Type the county name in the County box.")
+        if not feats:
+            sys.exit(f"No Tennessee parcel {tp['map']} {tp['group'] + ' ' if tp['group'] else ''}{tp['parcel']}" + (f" in {cn} County" if cn else "") +
+                     ". Check map/group/parcel on the assessor card (assessment.cot.tn.gov) — or use coordinates.")
+    elif pin:
         vs = list(dict.fromkeys(v for v in pin_variants(pin, cfg.get("pin_normalize", "loose")) if v))
         d = layer_query(url, {"where": f"{cfg['pin_field']} IN ({','.join(repr(v) for v in vs)})"}, "parcel")
         if not d.get("features"):                                 # some servers reject IN on text keys: fall back to one-by-one
@@ -223,7 +274,13 @@ def fetch_parcel_county(cfg, pin=None, lat=None, lon=None):
     if not norm["Acres"] and g("land_sqft"):
         try: norm["Acres"] = round(float(g("land_sqft")) / 43560, 2)
         except (TypeError, ValueError): pass
+    if cfg.get("pin_mode") == "tn":                                  # readable id + address order for Tennessee assessor data
+        gp = (pr.get("GP") or "").strip()
+        norm["PIN"] = f"{int(pr.get('COUNTY_ID') or 0):03d}-{(pr.get('CMAP') or '').strip()}{'-' + gp if gp else ''}-{(pr.get('PARCEL') or '').strip()}"
+        norm["SiteAddress"] = tn_address(norm["SiteAddress"])
+        if not norm["Acres"]: norm["Acres"] = None                   # DEEDAC 0 = not recorded → acres from the polygon
     parcel = ls.parcel_from_feature({"geometry": f["geometry"], "properties": norm}, cfg.get("defaults", {}))
+    if cfg.get("pin_mode") == "tn" and pr.get("COUNTY_NAME"): parcel["county"] = pr["COUNTY_NAME"]   # keep 'McNairy', not 'Mcnairy'
     if cfg.get("reverse_geocode") or not parcel["county"] or not parcel["situs"]:
         c = parcel["polygon"].centroid; rg = reverse_geocode(c.y, c.x)
         parcel["city"] = parcel["city"] or rg.get("city", ""); parcel["zip"] = parcel["zip"] or rg.get("zip", "")
@@ -798,7 +855,7 @@ def main():
         parcel["use_desc"] = parcel.get("use") or "land"
         log("parcel", "Regrid", apn=parcel["apn"])
     else:
-        parcel = fetch_parcel_county(cfg, a.pin, a.lat, a.lon)
+        parcel = fetch_parcel_county(cfg, a.pin, a.lat, a.lon, a.county_name)
     poly = parcel["polygon"]; c = poly.centroid
     out = Path(a.out or f"out/{str(parcel['apn']).replace('/', '_').replace(' ', '_')}"); out.mkdir(parents=True, exist_ok=True); (out / "ai").mkdir(exist_ok=True)
     (out / "parcel.geojson").write_text(json.dumps(parcel.get("feature") or {"type": "Feature", "geometry": poly.__geo_interface__, "properties": parcel["raw"]}))

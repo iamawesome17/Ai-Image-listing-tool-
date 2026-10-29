@@ -24,7 +24,7 @@ STATES = {"AL": "Alabama", "AR": "Arkansas", "FL": "Florida", "GA": "Georgia", "
 FIELD_HINTS = {
     "pin": ["pin", "parcelid", "parcel_id", "parcelno", "parcel_no", "parcel_num", "parcelnum", "apn", "parno", "pid", "prop_id", "propid", "gispin", "parcel", "taxid", "tax_id", "acctnum", "account"],
     "situs": ["siteaddress", "site_address", "siteadd", "situs", "situs_addr", "situsaddr", "prop_add", "propaddr", "prop_addr", "phy_addr1", "address", "location", "physaddr", "full_address", "fulladdr"],
-    "acres": ["gisacres", "gis_acres", "acres", "calc_acres", "calcacres", "deeded_acres", "deedacre", "deed_acres", "shape_area_acres", "acreage", "legalacres", "totacres"],
+    "acres": ["gisacres", "gis_acres", "acres", "deedac", "calc_acres", "calcacres", "deeded_acres", "deedacre", "deed_acres", "shape_area_acres", "acreage", "legalacres", "totacres"],
     "owner": ["ownername", "owner_name", "ownname", "owner", "own_name", "owner1", "deedhold", "taxpayer", "name"],
     "use": ["usecode", "use_code", "landuse", "land_use", "propclass", "prop_class", "class", "parusedesc", "usedesc", "dor_uc", "property_class", "classcode", "luc"],
     "legal": ["legaldesc", "legal_desc", "legal", "s_legal", "legaldescription"],

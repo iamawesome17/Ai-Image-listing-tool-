@@ -5,7 +5,8 @@ from multiple compass angles, each with the property line, pin, acreage card and
 
     python pipeline.py --county adams-il --pin 20-0-0636-002-00
     python pipeline.py --county adams-il --lat 39.91722 --lon -91.2892
-    python pipeline.py --county nc --pin 0096341                             # statewide layers: nc, fl, va
+    python pipeline.py --county nc --pin 0096341                             # statewide layers: nc, fl, va, tn
+    python pipeline.py --county tn --pin "002 001.02" --county-name McNairy  # TN needs the county (map+parcel repeats statewide)
     python pipeline.py --boundary parcel.kml --label "Smith 40"               # any parcel: Land id / Google Earth export
     python pipeline.py --regrid --apn 300006840 --path /us/ne/fillmore        # counties covered by your Regrid plan
     python drone_photo.py DJI_0042.JPG --county adams-il --pin 20-0-0636-002-00 --golden   # real drone photo
@@ -77,6 +78,7 @@ Domains the workspace must be allowed to reach (claude.ai → Settings → Capab
 | `nc` | North Carolina statewide (NC OneMap) | `parno` as on the county site | federal | parcel numbers are not unique statewide in a few counties — first match wins |
 | `fl` | Florida statewide (FDACS parcels) | `PARCEL_ID` | federal | no situs field → Geocoding fills street/city/zip |
 | `va` | Virginia statewide (VGIN) | `PARCELID` (localities format these differently; spacing is normalized) | federal | county from `LOCALITY`; Geocoding fills the rest |
+| `tn` | Tennessee statewide (Comptroller "Tennessee Property Boundaries Public Use", all 95 counties) | map + group + parcel as on the assessor card: `002 001.02`, `007C A 002.00`, or the full `055 002 00102 000`; **County box required** (same map+parcel exists in dozens of counties; county code 055 in a full id also works) | federal | `pin_mode: tn` parser in pipeline.tn_parts; address field is street-then-number (`SMITH LN 660`) → flipped to `660 Smith Ln`; DEEDAC 0 → acres from polygon; coordinates work with no county |
 | `realie` | **any US county** (Realie.ai, free tier, `REALIE_TOKEN`) | APN + state + county, or street address + state | federal | polygon, acres, situs, owner, use, legal. The nationwide default. |
 | `cass-mo` | Cass County, MO (CAMAvision WFS) | parcel id as on the assessor site | federal | pattern for Vanguard CAMAvision counties (MO/IA): attributes from `parcels`, polygon from `search` matched by envelope |
 | user-added | any county with a public ArcGIS parcel layer or CAMAvision map | layer's own id field | federal | **Counties tab** in the app: state + county (+ optional layer URL); fields auto-detected, checked live; saved to `DATA_DIR/counties_user.json` (mount a Railway volume at /app/data to keep them across deploys) |
@@ -180,6 +182,9 @@ or push packets to a Drive/Dropbox folder (next improvement).
 | Regrid lookup (where used) | $0.05–0.10 |
 
 ## Known limits / next improvements
+
+- Oct 29 2026: McNairy Co, TN failed every route (no TN source; Realie ignores coordinates). Fixed: built-in `tn` source, County box shown for statewide sources, Realie + coordinates now gives a clear message instead of a dead end.
+- Counties added in the app's Counties tab are lost on every Railway redeploy until a volume is mounted at /app/data (Railway → service → Settings → Volumes → mount path `/app/data`). Built-in sources in counties.json are not affected.
 
 - Outline on AI renders is where the model carried the marker — approximate by design; the satellite cover (p1_cover) is the accurate reference.
 - Simplified polygon on renders (approxPolyDP) — fine for L-shapes and notches, may round very fine jogs.
